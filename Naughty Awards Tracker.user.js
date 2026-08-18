@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.2.0
+// @version      1.2.1
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
@@ -14,7 +14,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.2.0";
+    const VERSION = "1.2.1";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
@@ -100,7 +100,7 @@
         }
         try {
             const response = await bridge.callHandler("isTornPDA");
-            state.runtime.isTornPDA = response?.isTornPDA === true;
+            state.runtime.isTornPDA = response === true || response?.isTornPDA === true || response?.is_torn_pda === true;
         } catch {
             // The documented TornPDA bridge is already present, but may not have finished
             // its readiness event yet. Keep its safe mobile layout until confirmation.
