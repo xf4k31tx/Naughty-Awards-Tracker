@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.0.1
+// @version      1.0.2
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
-// @match        https://www.torn.com/*
+// @match        https://www.torn.com/page.php?sid=awards*
 // @grant        GM_xmlhttpRequest
 // @grant        GM.getValue
 // @grant        GM.setValue
@@ -14,7 +14,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.0.1";
+    const VERSION = "1.0.2";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
