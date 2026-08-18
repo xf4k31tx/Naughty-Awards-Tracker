@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.0.0
+// @version      1.0.1
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/*
@@ -14,7 +14,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.0.0";
+    const VERSION = "1.0.1";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
@@ -221,8 +221,7 @@
         if (!state.cache) return "<div class='nat-empty'>Save an API key, then use Refresh to load your awards.</div>";
         if (state.activeTab === "honors") return "<div class='nat-list'>" + summaryCard("Honors", state.cache.honors, Infinity) + "</div>";
         if (state.activeTab === "medals") return "<div class='nat-list'>" + summaryCard("Medals", state.cache.medals, Infinity) + "</div>";
-        return "<div class='nat-grid'>" + summaryCard("Honors", state.cache.honors, 5) +
-            summaryCard("Medals", state.cache.medals, 5) + progressCard(state.cache.progress) + "</div>";
+        return "<div class='nat-grid nat-awards-main'>" + progressCard(state.cache.progress) + "</div>";
     }
     function settingsView() {
         return "<section class='nat-card nat-settings'><div class='nat-card-header'><h2>Settings</h2><button data-tab='awards'>Awards</button></div><label for='nat-api-key'>Torn API Key</label>" +
@@ -428,10 +427,10 @@
             "#nat-wrapper[data-theme='light']{background:#f8fafc;color:#172033;border-color:#cbd5e1}#nat-wrapper *,#nat-wrapper *:before,#nat-wrapper *:after{box-sizing:border-box;min-width:0;max-width:100%;overflow-wrap:anywhere}" +
             "#nat-drag{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;background:#2c2c2c;border-bottom:1px solid #444;cursor:move;user-select:none}#nat-wrapper[data-theme='light'] #nat-drag{background:#e2e8f0;border-color:#cbd5e1}" +
             "#nat-title{font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#nat-minimize{width:36px;height:30px;flex:0 0 36px;place-items:center;border:1px solid #666;border-radius:5px;color:#fff;background:#444;font-size:19px;font-weight:700;cursor:pointer}" +
-            "#nat-body{flex:1 1 auto;min-height:0;overflow:auto;padding:10px;scrollbar-width:none}#nat-body::-webkit-scrollbar{width:0;height:0}#nat-content{display:grid;gap:8px;transform:scale(var(--nat-scale,1));transform-origin:top left;width:calc(100% / var(--nat-scale,1))}" +
+            "#nat-body{flex:1 1 auto;min-height:0;overflow:auto;padding:10px;scrollbar-width:none;-ms-overflow-style:none}#nat-body::-webkit-scrollbar,.nat-list::-webkit-scrollbar{width:0;height:0}#nat-content{display:grid;gap:8px;align-items:stretch;transform:scale(var(--nat-scale,1));transform-origin:top left;width:calc(100% / var(--nat-scale,1))}" +
             ".nat-refresh{display:flex;justify-content:space-between;align-items:center;gap:8px;color:#aab4c4;font-size:10px}.nat-tabs{display:flex;gap:5px;flex-wrap:wrap}button{border:1px solid #4b5563;border-radius:4px;background:#2a2a2a;color:#fff;padding:6px 8px;font-size:11px;cursor:pointer}button:hover{filter:brightness(1.18)}button:disabled{opacity:.55;cursor:not-allowed}#nat-wrapper[data-theme='light'] button{background:#e2e8f0;color:#172033;border-color:#94a3b8}.nat-tab.active{background:#3b5998!important;color:#fff!important;font-weight:700}" +
-            ".nat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:8px;align-items:start}.nat-card{border:1px solid #2a2a2a;border-radius:8px;padding:10px;background:rgba(20,20,20,.7)}#nat-wrapper[data-theme='light'] .nat-card{background:#fff;border-color:#cbd5e1}.nat-card-header,.nat-progress-header{display:flex;justify-content:space-between;gap:8px;align-items:start}h2{margin:0 0 6px;font-size:13px}.nat-card-header strong,.nat-progress-header strong{color:#9dd8ff;font-size:11px;white-space:nowrap}.nat-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px}.nat-chip{border:1px solid #3b3b3b;border-radius:4px;padding:2px 5px;font-size:10px}" +
-            ".nat-award-row,.nat-progress-row{border-top:1px solid #2b2b2b;padding:7px 0}#nat-wrapper[data-theme='light'] .nat-award-row,#nat-wrapper[data-theme='light'] .nat-progress-row{border-color:#e2e8f0}.nat-award-row{display:flex;justify-content:space-between;gap:8px}.nat-award-copy{flex:1}.nat-award-row time,.nat-progress-value,.nat-description,.nat-empty,.nat-settings p{color:#9ca3af;font-size:10px;line-height:1.35}.nat-award-row time{white-space:nowrap}.nat-award-name{font-size:11px;font-weight:700}.nat-description{margin-top:2px}.nat-progress-track{height:6px;margin-top:6px;overflow:hidden;border-radius:3px;background:#222}.nat-progress-track>div{height:100%;background:#7fe18d}.nat-progress-value{margin-top:3px}.nat-list{max-height:100%;overflow:auto}.nat-settings{display:grid;gap:8px}.nat-settings label{font-size:11px;font-weight:700}.nat-key-row{display:flex;gap:6px}.nat-key-row input{flex:1;min-width:0;border:1px solid #64748b;border-radius:4px;background:#111;color:#fff;padding:6px}#nat-wrapper[data-theme='light'] .nat-key-row input{background:#fff;color:#172033}.nat-error{padding:7px;border:1px solid #a33;border-radius:5px;color:#ff9b9b;background:rgba(160,30,30,.18);font-size:11px}" +
+            ".nat-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;align-items:stretch;width:100%}.nat-card{width:100%;border:1px solid #2a2a2a;border-radius:8px;padding:10px;background:rgba(20,20,20,.7)}#nat-wrapper[data-theme='light'] .nat-card{background:#fff;border-color:#cbd5e1}.nat-card-header,.nat-progress-header{display:flex;justify-content:space-between;gap:8px;align-items:start}h2{margin:0 0 6px;font-size:13px}.nat-card-header strong,.nat-progress-header strong{color:#9dd8ff;font-size:11px;white-space:nowrap}.nat-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px}.nat-chip{border:1px solid #3b3b3b;border-radius:4px;padding:2px 5px;font-size:10px}" +
+            ".nat-award-row,.nat-progress-row{border-top:1px solid #2b2b2b;padding:7px 0}#nat-wrapper[data-theme='light'] .nat-award-row,#nat-wrapper[data-theme='light'] .nat-progress-row{border-color:#e2e8f0}.nat-award-row{display:flex;justify-content:space-between;gap:8px}.nat-award-copy{flex:1}.nat-award-row time,.nat-progress-value,.nat-description,.nat-empty,.nat-settings p{color:#9ca3af;font-size:10px;line-height:1.35}.nat-award-row time{white-space:nowrap}.nat-award-name{font-size:11px;font-weight:700}.nat-description{margin-top:2px}.nat-progress-track{height:6px;margin-top:6px;overflow:hidden;border-radius:3px;background:#222}.nat-progress-track>div{height:100%;background:#7fe18d}.nat-progress-value{margin-top:3px}.nat-list{width:100%;max-height:100%;overflow:auto;scrollbar-width:none;-ms-overflow-style:none}.nat-settings{display:grid;gap:8px}.nat-settings label{font-size:11px;font-weight:700}.nat-key-row{display:flex;gap:6px}.nat-key-row input{flex:1;min-width:0;border:1px solid #64748b;border-radius:4px;background:#111;color:#fff;padding:6px}#nat-wrapper[data-theme='light'] .nat-key-row input{background:#fff;color:#172033}.nat-error{padding:7px;border:1px solid #a33;border-radius:5px;color:#ff9b9b;background:rgba(160,30,30,.18);font-size:11px}" +
             ".nat-resize{position:absolute;z-index:4;width:20px;height:20px;touch-action:none}.nat-resize[data-corner='top-left']{left:0;top:0;cursor:nwse-resize}.nat-resize[data-corner='bottom-left']{left:0;bottom:0;cursor:nesw-resize}.nat-resize[data-corner='bottom-right']{right:0;bottom:0;cursor:nwse-resize}@container(max-width:430px){.nat-grid{grid-template-columns:1fr}.nat-card{padding:7px}}" +
             "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body'><div id='nat-content'></div></main><i class='nat-resize' data-corner='top-left' title='Resize this tab'></i><i class='nat-resize' data-corner='bottom-left' title='Resize this tab'></i><i class='nat-resize' data-corner='bottom-right' title='Resize this tab'></i>";
         document.body.appendChild(dashboard);
