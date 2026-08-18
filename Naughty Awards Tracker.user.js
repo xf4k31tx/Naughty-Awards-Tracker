@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.2.1
+// @version      1.3.0
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
@@ -14,7 +14,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.2.1";
+    const VERSION = "1.3.0";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
@@ -46,7 +46,7 @@
         apiKey: "", activeTab: "awards", theme: "dark", isMinimized: false,
         windowSizes: {}, position: null, cache: null, refreshedAt: 0,
         dashboard: null, refreshInFlight: false, dailyTimer: null, error: "",
-        searchQueries: { honors: "", medals: "" }, searchSaveTimer: null,
+        searchQueries: { honors: "", medals: "" }, collectionViews: { honors: "completed", medals: "completed" }, searchSaveTimer: null,
         runtime: {
             isTornPDA: Boolean(window.flutter_inappwebview && typeof window.flutter_inappwebview.callHandler === "function"),
             confirmed: false
@@ -172,21 +172,32 @@
         return Object.entries(raw || {}).map(([id, item]) => ({ ...(item || {}), id: item?.id ?? Number(id) }));
     }
     function buildSummary(catalogRaw, earnedRaw, fallback) {
-        const catalog = normalizeCatalog(catalogRaw);
-        const byId = new Map(catalog.map((item) => [Number(item.id), item]));
-        const earned = (Array.isArray(earnedRaw) ? earnedRaw : []).map((item) => {
-            const metadata = byId.get(Number(item.id)) || {};
-            return {
-                id: Number(item.id), timestamp: Number(item.timestamp || 0),
-                name: metadata.name || fallback + " #" + item.id,
-                description: metadata.description || "", rarity: metadata.rarity || "Unknown"
-            };
-        }).sort((a, b) => b.timestamp - a.timestamp);
+        const byId = new Map();
+        normalizeCatalog(catalogRaw).forEach((item) => {
+            const id = Number(item?.id);
+            if (!Number.isInteger(id) || id < 1 || byId.has(id)) return;
+            byId.set(id, {
+                id, name: String(item?.name || fallback + " #" + id),
+                description: String(item?.description || ""), rarity: String(item?.rarity || "Unknown")
+            });
+        });
+        const earnedById = new Map();
+        (Array.isArray(earnedRaw) ? earnedRaw : []).forEach((item) => {
+            const id = Number(item?.id);
+            if (!Number.isInteger(id) || id < 1) return;
+            const timestamp = Number(item?.timestamp);
+            earnedById.set(id, Math.max(Number.isFinite(timestamp) ? timestamp : 0, Number(earnedById.get(id) || 0)));
+        });
+        const catalog = [...byId.values()].sort((a, b) => a.id - b.id);
+        const earned = [...earnedById.entries()].map(([id, timestamp]) => {
+            const metadata = byId.get(id) || { id, name: fallback + " #" + id, description: "", rarity: "Unknown" };
+            return { ...metadata, timestamp };
+        }).sort((a, b) => b.timestamp - a.timestamp || a.name.localeCompare(b.name));
         const rarity = earned.reduce((result, item) => {
             result[item.rarity] = (result[item.rarity] || 0) + 1;
             return result;
         }, {});
-        return { totalEarned: earned.length, totalAvailable: catalog.length, earned, rarity };
+        return { totalEarned: earned.length, totalAvailable: catalog.length, catalog, ownedIds: [...earnedById.keys()], earned, rarity };
     }
     function getTracks(catalogRaw, type) {
         return normalizeCatalog(catalogRaw).flatMap((award) => {
@@ -260,13 +271,14 @@
             "<span class='nat-chip' style='color:" + (RARITY[rarity] || "#cbd5e1") + "'>" + escapeHtml(rarity) + ": " + formatInteger(count) + "</span>"
         ).join("");
     }
-    function awardRows(items, emptyText, limit) {
+    function awardRows(items, emptyText, limit, collectionView = "completed") {
         const visible = (items || []).slice(0, limit);
         if (!visible.length) return "<div class='nat-empty'>" + escapeHtml(emptyText) + "</div>";
         return visible.map((item) =>
             "<article class='nat-award-row'><span class='nat-award-marker' style='background:" + (RARITY[item.rarity] || "#cbd5e1") + ";color:" + (RARITY[item.rarity] || "#cbd5e1") + "'></span><div class='nat-award-copy'><div class='nat-award-name' style='color:" + (RARITY[item.rarity] || "#cbd5e1") + "'>" + escapeHtml(item.name) + "</div>" +
             (item.description ? "<div class='nat-description'>" + escapeHtml(item.description) + "</div>" : "") +
-            "</div><time>" + formatDate(item.timestamp) + "</time></article>"
+            "<div class='nat-award-meta'><span class='nat-award-rarity'>" + escapeHtml(item.rarity || "Unknown") + "</span><span>ID " + formatInteger(item.id) + "</span></div></div>" +
+            (collectionView === "incomplete" ? "<span class='nat-award-status'>Not earned</span>" : "<time>" + formatDate(item.timestamp) + "</time>") + "</article>"
         ).join("");
     }
     function filterAwardItems(items, query) {
@@ -285,15 +297,44 @@
         clearTimeout(state.searchSaveTimer);
         state.searchSaveTimer = setTimeout(saveDashboardState, 180);
     }
+    function selectedCollectionView(tab) {
+        return state.collectionViews[tab] === "incomplete" ? "incomplete" : "completed";
+    }
+    function incompleteAwardItems(summary) {
+        const ownedIds = new Set(Array.isArray(summary?.ownedIds) ? summary.ownedIds.map(Number) : (summary?.earned || []).map((item) => Number(item.id)));
+        return (summary?.catalog || []).filter((item) => !ownedIds.has(Number(item.id)))
+            .slice().sort((a, b) => a.name.localeCompare(b.name) || a.id - b.id);
+    }
+    function collectionItems(summary, collectionView) {
+        return collectionView === "incomplete" ? incompleteAwardItems(summary) : (summary?.earned || []);
+    }
+    function collectionSwitcher(tab, title, summary) {
+        const selected = selectedCollectionView(tab);
+        const completed = (summary?.earned || []).length;
+        const incomplete = incompleteAwardItems(summary).length;
+        return "<div class='nat-collection-switch' role='tablist' aria-label='" + escapeHtml(title) + " collection view'>" +
+            ["completed", "incomplete"].map((view) => {
+                const active = selected === view;
+                const count = view === "completed" ? completed : incomplete;
+                const label = view === "completed" ? "Completed" : "Incomplete";
+                return "<button type='button' class='nat-collection-tab " + (active ? "active" : "") + "' role='tab' aria-selected='" + active + "' data-action='collection-view' data-collection-tab='" + tab + "' data-collection-view='" + view + "'><span>" + label + "</span><b>" + formatInteger(count) + "</b></button>";
+            }).join("") + "</div>";
+    }
     function updateAwardSearchResults(tab, query) {
         const normalized = String(query || "");
         state.searchQueries[tab] = normalized;
         const summary = state.cache?.[tab];
-        const matches = filterAwardItems(summary?.earned, normalized);
+        const collectionView = selectedCollectionView(tab);
+        const matches = filterAwardItems(collectionItems(summary, collectionView), normalized);
         const results = state.dashboard?.querySelector("[data-search-results='" + tab + "']");
         const counter = state.dashboard?.querySelector("[data-search-count='" + tab + "']");
         const clear = state.dashboard?.querySelector("[data-action='clear-search'][data-search-tab='" + tab + "']");
-        if (results) results.innerHTML = awardRows(matches, normalized.trim() ? "No " + tab + " match this search." : "No " + tab + " earned yet.", Infinity);
+        const modeLabel = collectionView === "incomplete" ? "incomplete" : "completed";
+        const hasCatalog = Array.isArray(summary?.catalog);
+        const emptyText = !normalized.trim() && collectionView === "incomplete" && !hasCatalog
+            ? "Refresh to load the full " + tab + " catalog."
+            : (normalized.trim() ? "No " + tab + " match this search." : "No " + modeLabel + " " + tab + ".");
+        if (results) results.innerHTML = awardRows(matches, emptyText, Infinity, collectionView);
         if (counter) counter.textContent = formatInteger(matches.length) + " shown";
         if (clear) clear.hidden = !normalized.trim();
         queueSearchStateSave();
@@ -305,13 +346,18 @@
         const percent = available ? Math.min(100, earned / available * 100) : 0;
         const tab = state.activeTab;
         const searchable = (tab === "honors" || tab === "medals") && limit === Infinity;
+        const collectionView = selectedCollectionView(tab);
         const query = searchable ? (state.searchQueries[tab] || "") : "";
-        const visible = searchable ? filterAwardItems(summary?.earned, query) : (summary?.earned || []);
-        const emptyText = query ? "No " + title.toLowerCase() + " match this search." : "No " + title.toLowerCase() + " earned yet.";
+        const allItems = collectionItems(summary, collectionView);
+        const visible = searchable ? filterAwardItems(allItems, query) : allItems;
+        const hasCatalog = Array.isArray(summary?.catalog);
+        const emptyText = !query && collectionView === "incomplete" && !hasCatalog
+            ? "Refresh to load the full " + title.toLowerCase() + " catalog."
+            : (query ? "No " + title.toLowerCase() + " match this search." : "No " + (collectionView === "incomplete" ? "incomplete" : "completed") + " " + title.toLowerCase() + ".");
         return "<section class='nat-card nat-summary-card'><header class='nat-card-header'><div><span class='nat-eyebrow'>Collection</span><h2>" + title + "</h2></div><div class='nat-total'><strong>" +
             formatInteger(earned) + " / " + formatInteger(available) + "</strong><span>" + percent.toFixed(1) + "% complete</span></div>" +
             "</header><div class='nat-collection-track' aria-label='" + escapeHtml(title) + " collection progress'><i style='width:" + percent + "%'></i></div><div class='nat-chips'>" + rarityChips(summary) +
-            "</div>" + (searchable ? searchPanel(tab, title, visible.length, query) : "") + "<div class='nat-section-label'>" + (query ? "Matching awards" : "Latest earned") + "</div><div data-search-results='" + (searchable ? tab : "") + "'>" + awardRows(visible, emptyText, limit) + "</div></section>";
+            "</div>" + (searchable ? collectionSwitcher(tab, title, summary) + searchPanel(tab, title, visible.length, query) : "") + "<div class='nat-section-label'>" + (query ? "Matching awards" : (collectionView === "incomplete" ? "Not yet earned" : "Completed awards")) + "</div><div data-search-results='" + (searchable ? tab : "") + "'>" + awardRows(visible, emptyText, limit, collectionView) + "</div></section>";
     }
     function progressCard(progress) {
         const rows = (progress || []).map((item) =>
@@ -342,7 +388,7 @@
     function saveDashboardState() {
         gmSet(STORAGE.dashboard, {
             activeTab: state.activeTab, theme: state.theme, isMinimized: state.isMinimized,
-            windowSizes: state.windowSizes, searchQueries: state.searchQueries
+            windowSizes: state.windowSizes, searchQueries: state.searchQueries, collectionViews: state.collectionViews
         });
     }
     function sizeKey() {
@@ -469,6 +515,13 @@
             applySize();
             render();
         });
+        content.querySelectorAll("[data-action='collection-view']").forEach((button) => button.addEventListener("click", () => {
+            const tab = button.dataset.collectionTab;
+            if (!tab || !["honors", "medals"].includes(tab)) return;
+            state.collectionViews[tab] = button.dataset.collectionView === "incomplete" ? "incomplete" : "completed";
+            saveDashboardState();
+            render();
+        }));
         content.querySelector("[data-action='refresh']")?.addEventListener("click", () => void refreshAwards());
         content.querySelector("[data-action='save-key']")?.addEventListener("click", () => {
             state.apiKey = content.querySelector("#nat-api-key").value.trim();
@@ -628,6 +681,7 @@
             ".nat-search-panel{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 8px;align-items:center;margin:0 0 11px;padding:8px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-search-label{grid-column:1/-1;color:#a7c3e5;font-size:9px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.nat-search-field{display:flex;align-items:center;gap:6px;min-width:0;padding:0 7px;border:1px solid #4d6688;border-radius:7px;background:#101a29;transition:border-color .15s ease,box-shadow .15s ease}.nat-search-field:focus-within{border-color:#7ca8dc;box-shadow:0 0 0 3px rgba(98,150,210,.2)}.nat-search-field>span{color:#8eb5e5;font-size:15px;line-height:1}.nat-search-field input{width:100%;min-width:0;min-height:34px;border:0!important;outline:0;background:transparent!important;color:#f1f6ff!important;font:inherit;font-size:11px}.nat-search-field input::placeholder{color:#71839b}.nat-search-clear{width:26px;min-width:26px!important;min-height:26px!important;padding:0!important;border-color:transparent!important;background:transparent!important;color:#aebed3!important;font-size:18px!important;line-height:1}.nat-search-count{color:#8eb5e5;font-size:9px;font-weight:800;white-space:nowrap}.nat-summary-card [data-search-results]{min-width:0}#nat-wrapper[data-theme='light'] .nat-search-panel{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-search-label,#nat-wrapper[data-theme='light'] .nat-search-count{color:#385a7e}#nat-wrapper[data-theme='light'] .nat-search-field{background:#e6ecf2;border-color:#93a8bd}#nat-wrapper[data-theme='light'] .nat-search-field:focus-within{border-color:#4c78ad;box-shadow:0 0 0 3px rgba(72,112,162,.18)}#nat-wrapper[data-theme='light'] .nat-search-field input{color:#142238!important}#nat-wrapper[data-theme='light'] .nat-search-field input::placeholder{color:#667a90}#nat-wrapper[data-theme='light'] .nat-search-clear{color:#415b79!important}" +
             "#nat-wrapper[data-runtime='tornpda']{border-radius:14px;max-width:calc(100vw - 12px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));max-height:calc(100dvh - 12px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));box-shadow:0 10px 28px rgba(0,0,0,.48)}#nat-wrapper[data-runtime='tornpda'][data-edge='left']{margin-left:env(safe-area-inset-left, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='right']{margin-right:env(safe-area-inset-right, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='top']{margin-top:env(safe-area-inset-top, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='bottom']{margin-bottom:env(safe-area-inset-bottom, 0px)}#nat-wrapper[data-runtime='tornpda'] #nat-drag{min-height:52px;padding:10px 12px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] #nat-minimize{width:44px;height:40px;flex-basis:44px;font-size:23px}#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:10px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}#nat-wrapper[data-runtime='tornpda'] #nat-content{width:100%!important;transform:none!important}#nat-wrapper[data-runtime='tornpda'] button:not(.nat-search-clear){min-height:40px;padding:9px 11px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-icon-button{width:40px;min-height:40px;font-size:17px!important}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{min-height:48px;padding:4px;gap:5px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{min-height:38px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:12px}#nat-wrapper[data-runtime='tornpda'] .nat-list{max-height:none;overflow:visible}#nat-wrapper[data-runtime='tornpda'] .nat-resize{width:28px;height:28px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] .nat-search-field input{min-height:40px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-search-clear{width:32px;min-width:32px!important;min-height:32px!important;font-size:21px!important}" +
             "@container (max-width:430px){#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:8px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh{flex-wrap:wrap;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-sync-status{flex:1 1 100%}#nat-wrapper[data-runtime='tornpda'] .nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh-button{width:100%}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{gap:3px;padding:3px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{padding:7px 5px!important;font-size:10px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:10px}#nat-wrapper[data-runtime='tornpda'] .nat-search-panel{grid-template-columns:minmax(0,1fr)}#nat-wrapper[data-runtime='tornpda'] .nat-search-count{justify-self:start}#nat-wrapper[data-runtime='tornpda'] .nat-card-header{gap:6px}#nat-wrapper[data-runtime='tornpda'] .nat-total strong{font-size:11px!important}}@media (max-height:560px){#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-drag{min-height:44px;padding:7px 10px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-minimize{width:40px;height:34px;flex-basis:40px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-body{padding:7px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] .nat-card{padding:9px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] button:not(.nat-search-clear){min-height:34px;padding:7px 9px;font-size:11px}}" +
+            ".nat-collection-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:0 0 10px;padding:4px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-collection-tab{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0;background:transparent!important;border-color:transparent!important;color:#aebed3!important}.nat-collection-tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nat-collection-tab b{display:grid;place-items:center;min-width:22px;padding:2px 5px;border-radius:999px;color:#c9d9ef;background:rgba(118,151,193,.2);font-size:9px}.nat-collection-tab.active{background:#365d99!important;border-color:#5279b3!important;color:#fff!important;box-shadow:0 3px 8px rgba(6,12,22,.28)}.nat-collection-tab.active b{color:#fff;background:rgba(255,255,255,.18)}.nat-award-meta{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;color:#8fa7c3;font-size:9px;font-weight:750}.nat-award-meta span{padding:2px 5px;border:1px solid #38506e;border-radius:999px;background:rgba(9,16,26,.26)}.nat-award-rarity{color:inherit}.nat-award-status{align-self:start;margin-top:1px;padding:3px 5px;border:1px solid #5c6680;border-radius:5px;color:#b8c7dc;background:rgba(94,111,140,.16);font-size:9px;font-weight:800;line-height:1.2;white-space:nowrap}#nat-wrapper[data-theme='light'] .nat-collection-switch{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-collection-tab{color:#3c526b!important}#nat-wrapper[data-theme='light'] .nat-collection-tab.active{background:#365f99!important;border-color:#2b568f!important;color:#fff!important}#nat-wrapper[data-theme='light'] .nat-award-meta{color:#526981}#nat-wrapper[data-theme='light'] .nat-award-meta span{border-color:#a9bacb;background:#dce5ee}#nat-wrapper[data-theme='light'] .nat-award-status{border-color:#a0afbf;color:#3f536b;background:#d7e0e9}@container (max-width:380px){.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 5px!important;font-size:10px!important}.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}}" +
             "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body'><div id='nat-content'></div></main><i class='nat-resize' data-corner='top-left' title='Resize this tab'></i><i class='nat-resize' data-corner='bottom-left' title='Resize this tab'></i><i class='nat-resize' data-corner='bottom-right' title='Resize this tab'></i>";
         document.body.appendChild(dashboard);
         state.dashboard = dashboard;
@@ -649,6 +703,10 @@
         state.searchQueries = {
             honors: String(dashboard?.searchQueries?.honors || ""),
             medals: String(dashboard?.searchQueries?.medals || "")
+        };
+        state.collectionViews = {
+            honors: dashboard?.collectionViews?.honors === "incomplete" ? "incomplete" : "completed",
+            medals: dashboard?.collectionViews?.medals === "incomplete" ? "incomplete" : "completed"
         };
         state.position = position;
         state.cache = cache;

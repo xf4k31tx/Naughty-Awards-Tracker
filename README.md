@@ -5,4 +5,4 @@ Focused Torn userscript for Medals, Honors, and configured award-progress tracki
 Automatic refresh runs once per day at 00:00 UTC; each Awards view retains a manual refresh button.
 
 - Detects TornPDA through its native bridge and adapts to the active viewport, safe areas, orientation, and touch controls.
-- Honors and Medals support persistent search by award name, description, rarity, or ID.
+- Honors and Medals have persistent Completed and Incomplete catalog views, each searchable by award name, description, rarity, or ID.
