@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.1.0
+// @version      1.2.0
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
@@ -14,7 +14,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.1.0";
+    const VERSION = "1.2.0";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
@@ -45,8 +45,78 @@
     const state = {
         apiKey: "", activeTab: "awards", theme: "dark", isMinimized: false,
         windowSizes: {}, position: null, cache: null, refreshedAt: 0,
-        dashboard: null, refreshInFlight: false, dailyTimer: null, error: ""
+        dashboard: null, refreshInFlight: false, dailyTimer: null, error: "",
+        searchQueries: { honors: "", medals: "" }, searchSaveTimer: null,
+        runtime: {
+            isTornPDA: Boolean(window.flutter_inappwebview && typeof window.flutter_inappwebview.callHandler === "function"),
+            confirmed: false
+        }
     };
+
+    function getViewportMetrics() {
+        const viewport = window.visualViewport;
+        const width = Math.max(1, Math.round(Number(viewport?.width) || window.innerWidth || document.documentElement.clientWidth || 1));
+        const height = Math.max(1, Math.round(Number(viewport?.height) || window.innerHeight || document.documentElement.clientHeight || 1));
+        return {
+            width, height,
+            left: Math.round(Number(viewport?.offsetLeft) || 0),
+            top: Math.round(Number(viewport?.offsetTop) || 0),
+            orientation: height >= width ? "portrait" : "landscape"
+        };
+    }
+    function isTornPdaBridgeAvailable() {
+        return Boolean(window.flutter_inappwebview && typeof window.flutter_inappwebview.callHandler === "function");
+    }
+    function runtimeLabel() {
+        if (!state.runtime.isTornPDA) return "Desktop browser";
+        return state.runtime.confirmed ? "TornPDA" : "TornPDA · verifying";
+    }
+    function runtimeDescription() {
+        return state.runtime.isTornPDA
+            ? "Native TornPDA bridge detected. The panel follows your active device viewport."
+            : "Standard desktop browser layout is active.";
+    }
+    function updateRuntimeLayout() {
+        const dashboard = state.dashboard;
+        if (!dashboard) return;
+        const viewport = getViewportMetrics();
+        dashboard.dataset.runtime = state.runtime.isTornPDA ? "tornpda" : "desktop";
+        dashboard.dataset.orientation = viewport.orientation;
+        dashboard.dataset.compact = state.runtime.isTornPDA && (viewport.width < 480 || viewport.height < 520) ? "true" : "false";
+        dashboard.style.setProperty("--nat-viewport-width", viewport.width + "px");
+        dashboard.style.setProperty("--nat-viewport-height", viewport.height + "px");
+        const label = dashboard.querySelector("[data-runtime-label]");
+        const detail = dashboard.querySelector("[data-runtime-detail]");
+        if (label) label.textContent = runtimeLabel();
+        if (detail) detail.textContent = runtimeDescription();
+    }
+    async function confirmTornPdaRuntime() {
+        const bridge = window.flutter_inappwebview;
+        if (!bridge || typeof bridge.callHandler !== "function") {
+            state.runtime.isTornPDA = false;
+            state.runtime.confirmed = true;
+            updateRuntimeLayout();
+            return;
+        }
+        try {
+            const response = await bridge.callHandler("isTornPDA");
+            state.runtime.isTornPDA = response?.isTornPDA === true;
+        } catch {
+            // The documented TornPDA bridge is already present, but may not have finished
+            // its readiness event yet. Keep its safe mobile layout until confirmation.
+            state.runtime.isTornPDA = true;
+        } finally {
+            state.runtime.confirmed = true;
+            updateRuntimeLayout();
+            if (!state.isMinimized && state.dashboard) applySize();
+        }
+    }
+    function detectRuntimeAtStartup() {
+        state.runtime.isTornPDA = isTornPdaBridgeAvailable();
+        state.runtime.confirmed = !state.runtime.isTornPDA;
+        window.addEventListener("flutterInAppWebViewPlatformReady", () => void confirmTornPdaRuntime(), { once: true });
+        if (state.runtime.isTornPDA) window.setTimeout(() => void confirmTornPdaRuntime(), 0);
+    }
 
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -199,14 +269,49 @@
             "</div><time>" + formatDate(item.timestamp) + "</time></article>"
         ).join("");
     }
+    function filterAwardItems(items, query) {
+        const needle = String(query || "").trim().toLocaleLowerCase();
+        if (!needle) return Array.isArray(items) ? items : [];
+        return (items || []).filter((item) => [item.id, item.name, item.description, item.rarity]
+            .some((value) => String(value || "").toLocaleLowerCase().includes(needle)));
+    }
+    function searchPanel(tab, title, count, query) {
+        const clear = "<button class='nat-search-clear' data-action='clear-search' data-search-tab='" + tab + "' type='button' aria-label='Clear " + title + " search'" + (query ? "" : " hidden") + ">×</button>";
+        return "<div class='nat-search-panel'><label class='nat-search-label' for='nat-search-" + tab + "'>Search " + title + "</label>" +
+            "<div class='nat-search-field'><span aria-hidden='true'>⌕</span><input id='nat-search-" + tab + "' data-award-search='" + tab + "' type='search' autocomplete='off' spellcheck='false' value='" + escapeHtml(query) + "' placeholder='Name, description, rarity…' aria-label='Search " + title + "'>" + clear + "</div>" +
+            "<span class='nat-search-count' data-search-count='" + tab + "'>" + formatInteger(count) + " shown</span></div>";
+    }
+    function queueSearchStateSave() {
+        clearTimeout(state.searchSaveTimer);
+        state.searchSaveTimer = setTimeout(saveDashboardState, 180);
+    }
+    function updateAwardSearchResults(tab, query) {
+        const normalized = String(query || "");
+        state.searchQueries[tab] = normalized;
+        const summary = state.cache?.[tab];
+        const matches = filterAwardItems(summary?.earned, normalized);
+        const results = state.dashboard?.querySelector("[data-search-results='" + tab + "']");
+        const counter = state.dashboard?.querySelector("[data-search-count='" + tab + "']");
+        const clear = state.dashboard?.querySelector("[data-action='clear-search'][data-search-tab='" + tab + "']");
+        if (results) results.innerHTML = awardRows(matches, normalized.trim() ? "No " + tab + " match this search." : "No " + tab + " earned yet.", Infinity);
+        if (counter) counter.textContent = formatInteger(matches.length) + " shown";
+        if (clear) clear.hidden = !normalized.trim();
+        queueSearchStateSave();
+        fitContent();
+    }
     function summaryCard(title, summary, limit) {
         const earned = Number(summary?.totalEarned || 0);
         const available = Number(summary?.totalAvailable || 0);
         const percent = available ? Math.min(100, earned / available * 100) : 0;
+        const tab = state.activeTab;
+        const searchable = (tab === "honors" || tab === "medals") && limit === Infinity;
+        const query = searchable ? (state.searchQueries[tab] || "") : "";
+        const visible = searchable ? filterAwardItems(summary?.earned, query) : (summary?.earned || []);
+        const emptyText = query ? "No " + title.toLowerCase() + " match this search." : "No " + title.toLowerCase() + " earned yet.";
         return "<section class='nat-card nat-summary-card'><header class='nat-card-header'><div><span class='nat-eyebrow'>Collection</span><h2>" + title + "</h2></div><div class='nat-total'><strong>" +
             formatInteger(earned) + " / " + formatInteger(available) + "</strong><span>" + percent.toFixed(1) + "% complete</span></div>" +
             "</header><div class='nat-collection-track' aria-label='" + escapeHtml(title) + " collection progress'><i style='width:" + percent + "%'></i></div><div class='nat-chips'>" + rarityChips(summary) +
-            "</div><div class='nat-section-label'>Latest earned</div>" + awardRows(summary?.earned, "No " + title.toLowerCase() + " earned yet.", limit) + "</section>";
+            "</div>" + (searchable ? searchPanel(tab, title, visible.length, query) : "") + "<div class='nat-section-label'>" + (query ? "Matching awards" : "Latest earned") + "</div><div data-search-results='" + (searchable ? tab : "") + "'>" + awardRows(visible, emptyText, limit) + "</div></section>";
     }
     function progressCard(progress) {
         const rows = (progress || []).map((item) =>
@@ -231,41 +336,66 @@
             "<div class='nat-key-row'><input id='nat-api-key' type='password' autocomplete='off' value='" + escapeHtml(state.apiKey) +
             "' placeholder='Enter Torn API key'><button data-action='save-key'>Save Key</button></div>" +
             "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:00 UTC</strong><p>Manual refresh remains available whenever you need a new snapshot.</p></div>" +
+            "<div class='nat-setting-note nat-runtime-note'><span>Runtime</span><strong data-runtime-label>" + runtimeLabel() + "</strong><p data-runtime-detail>" + runtimeDescription() + "</p></div>" +
             "<button class='nat-theme-button' data-action='toggle-theme'>Use " + (state.theme === "dark" ? "Light" : "Dark") + " Mode</button></section>";
     }
     function saveDashboardState() {
         gmSet(STORAGE.dashboard, {
-            activeTab: state.activeTab, theme: state.theme, isMinimized: state.isMinimized, windowSizes: state.windowSizes
+            activeTab: state.activeTab, theme: state.theme, isMinimized: state.isMinimized,
+            windowSizes: state.windowSizes, searchQueries: state.searchQueries
         });
     }
     function sizeKey() {
         return state.activeTab === "settings" ? "settings" : "awards";
     }
     function getSizeLimits() {
+        const viewport = getViewportMetrics();
+        const margin = state.runtime.isTornPDA ? 12 : 20;
+        const maxWidth = Math.max(1, viewport.width - margin);
+        const maxHeight = Math.max(1, viewport.height - margin);
         return {
-            minWidth: Math.min(380, Math.max(260, window.innerWidth - 20)),
-            minHeight: Math.min(620, Math.max(320, window.innerHeight - 20)),
-            maxWidth: Math.max(260, window.innerWidth - 20),
-            maxHeight: Math.max(320, window.innerHeight - 20)
+            minWidth: Math.min(state.runtime.isTornPDA ? 300 : 380, maxWidth),
+            minHeight: Math.min(state.runtime.isTornPDA ? 340 : 620, maxHeight),
+            maxWidth, maxHeight
         };
+    }
+    function defaultSize(limits) {
+        const viewport = getViewportMetrics();
+        if (state.runtime.isTornPDA) {
+            const topOffset = viewport.orientation === "portrait" ? 60 : 12;
+            return {
+                width: limits.maxWidth,
+                height: clamp(viewport.height - topOffset - 12, limits.minHeight, limits.maxHeight)
+            };
+        }
+        return { width: 480, height: Math.min(720, Math.round(viewport.height * .8)) };
     }
     function applyPosition(position = state.position) {
         const dashboard = state.dashboard;
         if (!dashboard) return;
+        const viewport = getViewportMetrics();
         const rect = dashboard.getBoundingClientRect();
-        const saved = position || { edge: "right", x: window.innerWidth - rect.width, y: 20 };
-        const x = clamp(Number(saved.x || 0), 0, window.innerWidth - rect.width);
-        const y = clamp(Number(saved.y || 0), 0, window.innerHeight - rect.height);
+        const defaultTop = viewport.top + (state.runtime.isTornPDA && viewport.orientation === "portrait" ? 60 : 20);
+        const saved = position || { edge: "right", x: viewport.left + viewport.width - rect.width, y: defaultTop };
+        const maxX = Math.max(viewport.left, viewport.left + viewport.width - rect.width);
+        const maxY = Math.max(viewport.top, viewport.top + viewport.height - rect.height);
+        const x = clamp(Number(saved.x ?? viewport.left), viewport.left, maxX);
+        const y = clamp(Number(saved.y ?? viewport.top), viewport.top, maxY);
         dashboard.style.right = "auto";
         dashboard.style.bottom = "auto";
-        if (saved.edge === "left") { dashboard.style.left = "0px"; dashboard.style.top = y + "px"; }
-        else if (saved.edge === "top") { dashboard.style.left = x + "px"; dashboard.style.top = "0px"; }
-        else if (saved.edge === "bottom") { dashboard.style.left = x + "px"; dashboard.style.top = Math.max(0, window.innerHeight - rect.height) + "px"; }
-        else { dashboard.style.left = Math.max(0, window.innerWidth - rect.width) + "px"; dashboard.style.top = y + "px"; }
+        dashboard.dataset.edge = saved.edge || "right";
+        if (saved.edge === "left") { dashboard.style.left = viewport.left + "px"; dashboard.style.top = y + "px"; }
+        else if (saved.edge === "top") { dashboard.style.left = x + "px"; dashboard.style.top = viewport.top + "px"; }
+        else if (saved.edge === "bottom") { dashboard.style.left = x + "px"; dashboard.style.top = maxY + "px"; }
+        else { dashboard.style.left = maxX + "px"; dashboard.style.top = y + "px"; }
     }
     function savePosition() {
         const rect = state.dashboard.getBoundingClientRect();
-        const distances = { left: rect.left, right: window.innerWidth - rect.right, top: rect.top, bottom: window.innerHeight - rect.bottom };
+        const viewport = getViewportMetrics();
+        const distances = {
+            left: rect.left - viewport.left, right: viewport.left + viewport.width - rect.right,
+            top: rect.top - viewport.top, bottom: viewport.top + viewport.height - rect.bottom
+        };
         const edge = Object.entries(distances).sort((a, b) => a[1] - b[1])[0][0];
         state.position = { edge, x: rect.left, y: rect.top };
         gmSet(STORAGE.position, state.position);
@@ -281,9 +411,10 @@
         if (state.isMinimized) return;
         const dashboard = state.dashboard;
         const limits = getSizeLimits();
-        const saved = state.windowSizes[sizeKey()] || { width: 480, height: Math.min(720, window.innerHeight * .8) };
-        dashboard.style.width = clamp(Number(saved.width || 480), limits.minWidth, limits.maxWidth) + "px";
-        dashboard.style.height = clamp(Number(saved.height || 620), limits.minHeight, limits.maxHeight) + "px";
+        const fallback = defaultSize(limits);
+        const saved = state.windowSizes[sizeKey()] || fallback;
+        dashboard.style.width = clamp(Number(saved.width || fallback.width), limits.minWidth, limits.maxWidth) + "px";
+        dashboard.style.height = clamp(Number(saved.height || fallback.height), limits.minHeight, limits.maxHeight) + "px";
         applyPosition();
         fitContent();
     }
@@ -292,6 +423,7 @@
         const content = state.dashboard?.querySelector("#nat-content");
         if (!body || !content || state.isMinimized) return;
         body.style.setProperty("--nat-scale", "1");
+        if (state.runtime.isTornPDA) return;
         const scale = Math.max(.72, Math.min(1, Math.max(1, body.clientHeight - 4) / Math.max(1, content.scrollHeight)));
         body.style.setProperty("--nat-scale", String(scale));
     }
@@ -302,7 +434,7 @@
         const button = dashboard.querySelector("#nat-minimize");
         const handles = dashboard.querySelectorAll(".nat-resize");
         if (state.isMinimized) {
-            body.style.display = "none";
+            body.style.setProperty("display", "none", "important");
             dashboard.style.width = "48px";
             dashboard.style.height = "36px";
             title.textContent = "NAT";
@@ -310,7 +442,7 @@
             handles.forEach((handle) => { handle.style.display = "none"; });
             applyPosition();
         } else {
-            body.style.display = "flex";
+            body.style.setProperty("display", "flex", "important");
             title.textContent = "🏅 Naughty Awards Tracker v" + VERSION;
             button.style.display = "grid";
             handles.forEach((handle) => { handle.style.display = "block"; });
@@ -321,6 +453,7 @@
         const dashboard = state.dashboard;
         if (!dashboard) return;
         dashboard.dataset.theme = state.theme;
+        updateRuntimeLayout();
         const content = dashboard.querySelector("#nat-content");
         const tabs = [["awards", "Awards"], ["honors", "Honors"], ["medals", "Medals"]].map(([id, label]) =>
             "<button class='nat-tab " + (state.activeTab === id ? "active" : "") + "' data-tab='" + id + "'>" + label + "</button>"
@@ -349,6 +482,17 @@
             saveDashboardState();
             render();
         });
+        content.querySelectorAll("[data-award-search]").forEach((input) => input.addEventListener("input", () => {
+            updateAwardSearchResults(input.dataset.awardSearch, input.value);
+        }));
+        content.querySelectorAll("[data-action='clear-search']").forEach((button) => button.addEventListener("click", () => {
+            const tab = button.dataset.searchTab;
+            const input = content.querySelector("#nat-search-" + tab);
+            if (!input) return;
+            input.value = "";
+            updateAwardSearchResults(tab, "");
+            input.focus();
+        }));
         fitContent();
     }
     function scheduleDailyRefresh() {
@@ -363,23 +507,37 @@
     function bindWindowControls() {
         const dashboard = state.dashboard;
         const drag = dashboard.querySelector("#nat-drag");
-        let dragging = false, moved = false, offsetX = 0, offsetY = 0;
-        drag.addEventListener("mousedown", (event) => {
-            if (event.target.closest("#nat-minimize")) return;
+        let dragging = false, moved = false, dragPointerId = null, offsetX = 0, offsetY = 0;
+        const isPrimaryPointer = (event) => event.isPrimary && (event.pointerType !== "mouse" || event.button === 0);
+        drag.addEventListener("pointerdown", (event) => {
+            if (!isPrimaryPointer(event) || event.target.closest("#nat-minimize")) return;
             const rect = dashboard.getBoundingClientRect();
-            dragging = true; moved = false; offsetX = event.clientX - rect.left; offsetY = event.clientY - rect.top;
+            dragging = true;
+            moved = false;
+            dragPointerId = event.pointerId;
+            offsetX = event.clientX - rect.left;
+            offsetY = event.clientY - rect.top;
+            drag.setPointerCapture?.(event.pointerId);
+            event.preventDefault();
         });
-        document.addEventListener("mousemove", (event) => {
-            if (!dragging) return;
-            moved = true;
+        document.addEventListener("pointermove", (event) => {
+            if (!dragging || event.pointerId !== dragPointerId) return;
+            const viewport = getViewportMetrics();
             const rect = dashboard.getBoundingClientRect();
-            dashboard.style.left = clamp(event.clientX - offsetX, 0, window.innerWidth - rect.width) + "px";
-            dashboard.style.top = clamp(event.clientY - offsetY, 0, window.innerHeight - rect.height) + "px";
+            const left = clamp(event.clientX - offsetX, viewport.left, Math.max(viewport.left, viewport.left + viewport.width - rect.width));
+            const top = clamp(event.clientY - offsetY, viewport.top, Math.max(viewport.top, viewport.top + viewport.height - rect.height));
+            moved = moved || Math.abs(left - rect.left) > 2 || Math.abs(top - rect.top) > 2;
+            dashboard.style.left = left + "px";
+            dashboard.style.top = top + "px";
         });
-        document.addEventListener("mouseup", () => {
+        const finishDragging = (event) => {
+            if (!dragging || (event && event.pointerId !== dragPointerId)) return;
             if (dragging) savePosition();
             dragging = false;
-        });
+            dragPointerId = null;
+        };
+        document.addEventListener("pointerup", finishDragging);
+        document.addEventListener("pointercancel", finishDragging);
         drag.addEventListener("click", () => {
             if (!state.isMinimized || moved) return;
             state.isMinimized = false;
@@ -394,33 +552,53 @@
             saveDashboardState();
             applyWidgetView();
         });
-        let resizing = false, start = null;
-        dashboard.querySelectorAll(".nat-resize").forEach((handle) => handle.addEventListener("mousedown", (event) => {
-            if (state.isMinimized) return;
+        let resizing = false, resizePointerId = null, start = null;
+        dashboard.querySelectorAll(".nat-resize").forEach((handle) => handle.addEventListener("pointerdown", (event) => {
+            if (state.isMinimized || !isPrimaryPointer(event)) return;
             event.preventDefault(); event.stopPropagation();
             resizing = true;
+            resizePointerId = event.pointerId;
             start = { x: event.clientX, y: event.clientY, rect: dashboard.getBoundingClientRect(), corner: handle.dataset.corner };
             document.body.style.userSelect = "none";
+            handle.setPointerCapture?.(event.pointerId);
         }));
-        document.addEventListener("mousemove", (event) => {
-            if (!resizing || !start) return;
+        document.addEventListener("pointermove", (event) => {
+            if (!resizing || !start || event.pointerId !== resizePointerId) return;
             const limits = getSizeLimits();
+            const viewport = getViewportMetrics();
             const fromLeft = start.corner.endsWith("left");
             const fromTop = start.corner.startsWith("top");
-            const width = clamp(start.rect.width + (fromLeft ? start.x - event.clientX : event.clientX - start.x), limits.minWidth, Math.min(limits.maxWidth, fromLeft ? start.rect.right : window.innerWidth - start.rect.left));
-            const height = clamp(start.rect.height + (fromTop ? start.y - event.clientY : event.clientY - start.y), limits.minHeight, Math.min(limits.maxHeight, fromTop ? start.rect.bottom : window.innerHeight - start.rect.top));
+            const maxWidth = Math.min(limits.maxWidth, fromLeft ? start.rect.right - viewport.left : viewport.left + viewport.width - start.rect.left);
+            const maxHeight = Math.min(limits.maxHeight, fromTop ? start.rect.bottom - viewport.top : viewport.top + viewport.height - start.rect.top);
+            const width = clamp(start.rect.width + (fromLeft ? start.x - event.clientX : event.clientX - start.x), limits.minWidth, Math.max(limits.minWidth, maxWidth));
+            const height = clamp(start.rect.height + (fromTop ? start.y - event.clientY : event.clientY - start.y), limits.minHeight, Math.max(limits.minHeight, maxHeight));
             dashboard.style.width = width + "px";
             dashboard.style.height = height + "px";
             dashboard.style.left = (fromLeft ? start.rect.right - width : start.rect.left) + "px";
             dashboard.style.top = (fromTop ? start.rect.bottom - height : start.rect.top) + "px";
             fitContent();
         });
-        document.addEventListener("mouseup", () => {
-            if (!resizing) return;
-            resizing = false; start = null; document.body.style.userSelect = "";
+        const finishResizing = (event) => {
+            if (!resizing || (event && event.pointerId !== resizePointerId)) return;
+            resizing = false;
+            resizePointerId = null;
+            start = null;
+            document.body.style.userSelect = "";
             saveSize(); savePosition(); render();
-        });
-        window.addEventListener("resize", () => { applySize(); saveSize(); });
+        };
+        document.addEventListener("pointerup", finishResizing);
+        document.addEventListener("pointercancel", finishResizing);
+        let viewportFrame = 0;
+        const refreshViewportLayout = () => {
+            cancelAnimationFrame(viewportFrame);
+            viewportFrame = requestAnimationFrame(() => {
+                updateRuntimeLayout();
+                if (!state.isMinimized) applySize();
+            });
+        };
+        window.addEventListener("resize", refreshViewportLayout);
+        window.addEventListener("orientationchange", refreshViewportLayout);
+        window.visualViewport?.addEventListener("resize", refreshViewportLayout);
     }
     function initializeDashboard() {
         const dashboard = document.createElement("aside");
@@ -445,9 +623,15 @@
             ".nat-empty-card{display:grid;justify-items:start;gap:8px;min-height:180px;align-content:center;text-align:left}.nat-empty-card h2{margin:0!important;font-size:16px!important}.nat-empty-card p,.nat-empty{margin:0;color:#9baabd;font-size:11px;line-height:1.5}.nat-empty-icon{font-size:24px;filter:drop-shadow(0 4px 8px rgba(82,142,209,.25))}.nat-settings{gap:11px}.nat-settings label{color:#dbe8f8;font-size:11px;font-weight:800}.nat-key-row{gap:7px}.nat-key-row input{border-color:#4d6282;border-radius:7px;background:#111a28;color:#f7fbff;padding:8px 9px;font-size:11px}.nat-key-row button{white-space:nowrap;background:#28704d!important;border-color:#3b8b62!important}.nat-ghost-button{background:transparent!important;color:#9dd8ff!important}.nat-setting-note{padding:9px;border:1px solid #3c5271;border-radius:8px;background:rgba(7,13,22,.28)}.nat-setting-note span{display:block;color:#8eb5e5;font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.nat-setting-note strong{display:block;margin-top:3px;color:#edf4ff;font-size:11px}.nat-setting-note p{margin:4px 0 0;color:#9baabd;font-size:10px;line-height:1.4}.nat-theme-button{justify-self:start}.nat-error{padding:9px 10px;border-color:#a34b55;border-radius:8px;color:#ffb1b7;background:rgba(151,45,55,.18);font-size:10px;font-weight:650}" +
             "#nat-wrapper[data-theme='light'] .nat-refresh{color:#60728a}#nat-wrapper[data-theme='light'] .nat-sync-status strong,#nat-wrapper[data-theme='light'] .nat-setting-note strong{color:#172033}#nat-wrapper[data-theme='light'] .nat-sync-status small,#nat-wrapper[data-theme='light'] .nat-total span,#nat-wrapper[data-theme='light'] .nat-description,#nat-wrapper[data-theme='light'] .nat-progress-value,#nat-wrapper[data-theme='light'] .nat-empty-card p,#nat-wrapper[data-theme='light'] .nat-setting-note p{color:#63758c}#nat-wrapper[data-theme='light'] .nat-tabs{border-color:#cbd8e7;background:#f7faff}#nat-wrapper[data-theme='light'] .nat-tab{color:#5d6e84!important}#nat-wrapper[data-theme='light'] .nat-tab.active{background:#416cab!important;border-color:#416cab!important}#nat-wrapper[data-theme='light'] .nat-collection-track,#nat-wrapper[data-theme='light'] .nat-progress-track{background:#e7eef7;border-color:#cfdae8}#nat-wrapper[data-theme='light'] .nat-chip,#nat-wrapper[data-theme='light'] .nat-setting-note{background:#f7faff;border-color:#cbd8e7}#nat-wrapper[data-theme='light'] .nat-section-label{color:#73869c}#nat-wrapper[data-theme='light'] .nat-award-row,#nat-wrapper[data-theme='light'] .nat-progress-row{border-color:#e0e8f1}#nat-wrapper[data-theme='light'] .nat-award-row:hover{background:#edf4fb}#nat-wrapper[data-theme='light'] .nat-award-row time{border-color:#cfdae8;color:#64758b}#nat-wrapper[data-theme='light'] .nat-settings label{color:#172033}#nat-wrapper[data-theme='light'] .nat-key-row input{background:#fff;color:#172033;border-color:#aebed1}" +
             "@container (max-width:380px){#nat-body{padding:9px}.nat-refresh{gap:6px}.nat-sync-status small{display:none}.nat-refresh-button{padding:6px 7px!important}.nat-icon-button{width:29px;font-size:13px!important}.nat-tabs{gap:4px;padding:3px}.nat-tab{padding:6px 5px!important;font-size:10px!important}.nat-card{padding:10px}.nat-card-header h2{font-size:13px}.nat-total span{display:none}.nat-award-row{grid-template-columns:4px minmax(0,1fr);gap:7px}.nat-award-row time{grid-column:2;justify-self:start;margin:1px 0 0}.nat-progress-value{font-size:9px}.nat-key-row{flex-direction:column}.nat-key-row button,.nat-theme-button{width:100%}}" +
+            "</style><style>" +
+            "#nat-wrapper{isolation:isolate}#nat-drag{touch-action:none}#nat-wrapper[data-theme='light']{background:linear-gradient(155deg,#d7e0e9,#c5d0dc);color:#142238;border-color:#96aabd;box-shadow:0 14px 32px rgba(29,46,68,.24)}#nat-wrapper[data-theme='light'] #nat-drag{background:linear-gradient(90deg,#aebdce,#95a8bb);border-color:#8197ad;color:#112036}#nat-wrapper[data-theme='light'] #nat-body{background:linear-gradient(180deg,rgba(178,194,211,.62),rgba(205,216,228,.48))}#nat-wrapper[data-theme='light'] .nat-card{background:linear-gradient(145deg,#e1e8ef,#d5e0ea);border-color:#a9bacb;box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 5px 13px rgba(34,53,77,.13)}#nat-wrapper[data-theme='light'] .nat-card-header h2,#nat-wrapper[data-theme='light'] .nat-sync-status strong,#nat-wrapper[data-theme='light'] .nat-setting-note strong{color:#142238}#nat-wrapper[data-theme='light'] .nat-refresh{color:#465b73}#nat-wrapper[data-theme='light'] .nat-sync-status small,#nat-wrapper[data-theme='light'] .nat-total span,#nat-wrapper[data-theme='light'] .nat-description,#nat-wrapper[data-theme='light'] .nat-progress-value,#nat-wrapper[data-theme='light'] .nat-empty-card p,#nat-wrapper[data-theme='light'] .nat-setting-note p{color:#4c6076}#nat-wrapper[data-theme='light'] button{background:#c8d5e2;color:#142238;border-color:#859bb4}#nat-wrapper[data-theme='light'] .nat-tabs{background:rgba(173,190,207,.64);border-color:#93a8bd}#nat-wrapper[data-theme='light'] .nat-tab{color:#3c526b!important}#nat-wrapper[data-theme='light'] .nat-tab.active{background:#365f99!important;border-color:#2b568f!important;color:#fff!important}#nat-wrapper[data-theme='light'] .nat-collection-track,#nat-wrapper[data-theme='light'] .nat-progress-track{background:#bdcad8;border-color:#9eafc0}#nat-wrapper[data-theme='light'] .nat-chip,#nat-wrapper[data-theme='light'] .nat-setting-note{background:#d5dfe9;border-color:#a7b8c9}#nat-wrapper[data-theme='light'] .nat-section-label{color:#526981}#nat-wrapper[data-theme='light'] .nat-award-row,#nat-wrapper[data-theme='light'] .nat-progress-row{border-color:#b7c5d3}#nat-wrapper[data-theme='light'] .nat-award-row:hover{background:rgba(104,133,166,.14)}#nat-wrapper[data-theme='light'] .nat-award-row time{border-color:#a9bacb;color:#42576f}#nat-wrapper[data-theme='light'] .nat-settings label{color:#142238}#nat-wrapper[data-theme='light'] .nat-key-row input{background:#e3e9ef;color:#142238;border-color:#91a6bc}" +
+            ".nat-search-panel{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 8px;align-items:center;margin:0 0 11px;padding:8px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-search-label{grid-column:1/-1;color:#a7c3e5;font-size:9px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.nat-search-field{display:flex;align-items:center;gap:6px;min-width:0;padding:0 7px;border:1px solid #4d6688;border-radius:7px;background:#101a29;transition:border-color .15s ease,box-shadow .15s ease}.nat-search-field:focus-within{border-color:#7ca8dc;box-shadow:0 0 0 3px rgba(98,150,210,.2)}.nat-search-field>span{color:#8eb5e5;font-size:15px;line-height:1}.nat-search-field input{width:100%;min-width:0;min-height:34px;border:0!important;outline:0;background:transparent!important;color:#f1f6ff!important;font:inherit;font-size:11px}.nat-search-field input::placeholder{color:#71839b}.nat-search-clear{width:26px;min-width:26px!important;min-height:26px!important;padding:0!important;border-color:transparent!important;background:transparent!important;color:#aebed3!important;font-size:18px!important;line-height:1}.nat-search-count{color:#8eb5e5;font-size:9px;font-weight:800;white-space:nowrap}.nat-summary-card [data-search-results]{min-width:0}#nat-wrapper[data-theme='light'] .nat-search-panel{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-search-label,#nat-wrapper[data-theme='light'] .nat-search-count{color:#385a7e}#nat-wrapper[data-theme='light'] .nat-search-field{background:#e6ecf2;border-color:#93a8bd}#nat-wrapper[data-theme='light'] .nat-search-field:focus-within{border-color:#4c78ad;box-shadow:0 0 0 3px rgba(72,112,162,.18)}#nat-wrapper[data-theme='light'] .nat-search-field input{color:#142238!important}#nat-wrapper[data-theme='light'] .nat-search-field input::placeholder{color:#667a90}#nat-wrapper[data-theme='light'] .nat-search-clear{color:#415b79!important}" +
+            "#nat-wrapper[data-runtime='tornpda']{border-radius:14px;max-width:calc(100vw - 12px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));max-height:calc(100dvh - 12px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));box-shadow:0 10px 28px rgba(0,0,0,.48)}#nat-wrapper[data-runtime='tornpda'][data-edge='left']{margin-left:env(safe-area-inset-left, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='right']{margin-right:env(safe-area-inset-right, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='top']{margin-top:env(safe-area-inset-top, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='bottom']{margin-bottom:env(safe-area-inset-bottom, 0px)}#nat-wrapper[data-runtime='tornpda'] #nat-drag{min-height:52px;padding:10px 12px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] #nat-minimize{width:44px;height:40px;flex-basis:44px;font-size:23px}#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:10px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}#nat-wrapper[data-runtime='tornpda'] #nat-content{width:100%!important;transform:none!important}#nat-wrapper[data-runtime='tornpda'] button:not(.nat-search-clear){min-height:40px;padding:9px 11px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-icon-button{width:40px;min-height:40px;font-size:17px!important}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{min-height:48px;padding:4px;gap:5px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{min-height:38px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:12px}#nat-wrapper[data-runtime='tornpda'] .nat-list{max-height:none;overflow:visible}#nat-wrapper[data-runtime='tornpda'] .nat-resize{width:28px;height:28px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] .nat-search-field input{min-height:40px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-search-clear{width:32px;min-width:32px!important;min-height:32px!important;font-size:21px!important}" +
+            "@container (max-width:430px){#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:8px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh{flex-wrap:wrap;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-sync-status{flex:1 1 100%}#nat-wrapper[data-runtime='tornpda'] .nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh-button{width:100%}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{gap:3px;padding:3px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{padding:7px 5px!important;font-size:10px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:10px}#nat-wrapper[data-runtime='tornpda'] .nat-search-panel{grid-template-columns:minmax(0,1fr)}#nat-wrapper[data-runtime='tornpda'] .nat-search-count{justify-self:start}#nat-wrapper[data-runtime='tornpda'] .nat-card-header{gap:6px}#nat-wrapper[data-runtime='tornpda'] .nat-total strong{font-size:11px!important}}@media (max-height:560px){#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-drag{min-height:44px;padding:7px 10px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-minimize{width:40px;height:34px;flex-basis:40px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-body{padding:7px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] .nat-card{padding:9px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] button:not(.nat-search-clear){min-height:34px;padding:7px 9px;font-size:11px}}" +
             "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body'><div id='nat-content'></div></main><i class='nat-resize' data-corner='top-left' title='Resize this tab'></i><i class='nat-resize' data-corner='bottom-left' title='Resize this tab'></i><i class='nat-resize' data-corner='bottom-right' title='Resize this tab'></i>";
         document.body.appendChild(dashboard);
         state.dashboard = dashboard;
+        updateRuntimeLayout();
         bindWindowControls();
         applyWidgetView();
         render();
@@ -462,12 +646,17 @@
         state.theme = dashboard?.theme === "light" ? "light" : "dark";
         state.isMinimized = dashboard?.isMinimized === true;
         state.windowSizes = dashboard?.windowSizes && typeof dashboard.windowSizes === "object" ? dashboard.windowSizes : {};
+        state.searchQueries = {
+            honors: String(dashboard?.searchQueries?.honors || ""),
+            medals: String(dashboard?.searchQueries?.medals || "")
+        };
         state.position = position;
         state.cache = cache;
         state.refreshedAt = Number(refreshedAt || 0);
         initializeDashboard();
         scheduleDailyRefresh();
     }
+    detectRuntimeAtStartup();
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => void bootstrap());
     else void bootstrap();
 })();
