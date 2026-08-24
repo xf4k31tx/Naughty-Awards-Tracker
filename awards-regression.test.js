@@ -18,6 +18,11 @@ assert.match(source, /data-corner='bottom-right'[^>]*aria-label='Resize window f
 assert.match(source, /querySelectorAll\("\.nat-resize"\)\.forEach\(\(handle\) => handle\.addEventListener\("keydown"/, "Resize controls must retain keyboard support");
 assert.match(source, /#nat-body\{[^}]*overflow:auto[^}]*scrollbar-width:none[^}]*scrollbar-color:transparent transparent/, "The main scroll region must remain scrollable with hidden scrollbars");
 assert.match(source, /#nat-body::-webkit-scrollbar,\.nat-list::-webkit-scrollbar\{display:none!important/, "WebKit scrollbars must stay hidden");
+assert.match(source, /#nat-body\{[^}]*overflow:auto[^}]*touch-action:pan-y pinch-zoom[^}]*-webkit-overflow-scrolling:touch/, "The main scroll region must preserve touch scrolling");
+assert.match(source, /\.nat-list\{[^}]*max-height:none[^}]*overflow:visible/, "Collection wrappers must not create clipped nested scrolling");
+assert.match(source, /#nat-body::-webkit-scrollbar-track[^}]*background:transparent!important/, "Scrollbar tracks must stay visually hidden");
+assert.match(source, /<main id='nat-body' tabindex='0' aria-label='Awards Tracker content'>/, "The main scroll region must remain keyboard-focusable");
+assert.match(readme, /one keyboard-focusable content region/, "README must document the scrolling behavior");
 assert.match(source, /const LOG_PREFIX = "\[Naughty Awards Tracker\]";/, "Console diagnostics must retain a clear script prefix");
 assert.match(source, /function apiDiagnosticTarget\(url, method = "GET"\)/, "API logs must use a query-free target helper");
 assert.match(source, /API request started/, "API request lifecycle logs must remain available");
