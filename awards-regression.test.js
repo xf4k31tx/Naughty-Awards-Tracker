@@ -14,7 +14,10 @@ const instrumented = source.replace(
     "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, parseBackupPayload };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
-assert.match(source, /@version\s+1\.3\.8/, "Userscript metadata must reflect the native/persistence release");
+assert.match(source, /@version\s+1\.3\.10/, "Userscript metadata must reflect the native/persistence release");
+assert.match(source, /https:\/\/github\.com\/SharpSplinter\/Naughty-Awards-Tracker/, "metadata must use the renamed GitHub account");
+assert.match(source, /https:\/\/raw\.githubusercontent\.com\/SharpSplinter\/Naughty-Awards-Tracker\/main/, "metadata must update from the renamed account");
+assert.doesNotMatch(source + readme, /xf4k31tx/, "stale GitHub account links must not remain");
 assert.match(source, /data-corner='bottom-left'[^>]*aria-label='Resize window from the bottom-left corner/, "Bottom-left resize control must remain accessible");
 assert.match(source, /data-corner='bottom-right'[^>]*aria-label='Resize window from the bottom-right corner/, "Bottom-right resize control must remain accessible");
 assert.match(source, /querySelectorAll\("\.nat-resize"\)\.forEach\(\(handle\) => handle\.addEventListener\("keydown"/, "Resize controls must retain keyboard support");
@@ -58,6 +61,11 @@ assert.match(source, /const BACKUP_NAMESPACE = "naughty-awards-tracker\.backup";
 assert.match(source, /function validateBackupPayload\(payload\)/, "Awards backup files must be validated before restore");
 assert.match(source, /data-action='confirm-backup-restore'/, "Awards backup restore must require a second user action");
 assert.match(source, /data-action='toggle-backup-api-key'/, "Awards backup keys must remain opt-in");
+assert.match(source, /async function shareTextWithTornPDA\(text, fileName\)/, "Awards backups must use the documented TornPDA native share path");
+assert.match(source, /callHandler\("shareFile", \{ base64Data, fileName \}\)/, "Awards backups must pass Base64 data and a filename to TornPDA shareFile");
+assert.match(source, /response\?\.status === "success"/, "Awards backups must wait for a successful TornPDA share response");
+assert.match(source, /Backup opened in the TornPDA share sheet\./, "Awards backup feedback must identify the native share sheet");
+assert.match(source, /backupExportInFlight: false/, "Awards backups must prevent overlapping native share requests");
 
 const legacyValues = new Map();
 const pdaValues = {};

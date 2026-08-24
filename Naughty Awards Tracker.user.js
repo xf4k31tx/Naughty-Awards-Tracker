@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
-// @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.3.8
+// @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
+// @version      1.3.10
 // @description  Focused Torn medal, honor, and award-progress tracker.
-// @author       sharpsplinter [315311]
+// @author       SharpSplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
+// @source       https://raw.githubusercontent.com/SharpSplinter/Naughty-Awards-Tracker/main/Naughty%20Awards%20Tracker.user.js
+// @updateURL    https://raw.githubusercontent.com/SharpSplinter/Naughty-Awards-Tracker/main/Naughty%20Awards%20Tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/SharpSplinter/Naughty-Awards-Tracker/main/Naughty%20Awards%20Tracker.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @grant        GM_getValue
@@ -19,7 +22,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.8";
+    const VERSION = "1.3.10";
     const BASE_URL = "https://api.torn.com/v2/";
     const PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_";
     const NATIVE_REMINDER_ID = 6324;
@@ -62,7 +65,7 @@
         windowSizes: {}, position: null, cache: null, refreshedAt: 0,
         dashboard: null, refreshInFlight: false, dailyTimer: null, dailyRefreshDueAt: 0, autoRefreshQueued: false, refreshPaused: false,
         reminderTimer: null, toastTimer: null, activityBound: false, nativeTabActive: true, nativeTabVisible: true,
-        backupIncludeApiKey: false, pendingBackup: null, restoreInFlight: false, error: "", useLegacyGMStorage: false,
+        backupIncludeApiKey: false, pendingBackup: null, restoreInFlight: false, backupExportInFlight: false, error: "", useLegacyGMStorage: false,
         searchQueries: { honors: "", medals: "" }, collectionViews: { honors: "completed", medals: "completed" }, searchSaveTimer: null,
         runtime: {
             isTornPDA: false,
@@ -1041,7 +1044,7 @@
             "<label class='nat-storage-toggle' for='nat-use-legacy-gm-storage'><input id='nat-use-legacy-gm-storage' type='checkbox' data-action='toggle-legacy-storage'" + legacyChecked + "><span><strong>Use legacy GM storage</strong><small>Moves current tracker data before switching the primary store.</small></span></label>" +
             "<div class='nat-setting-note nat-backup-note'><span>Backup &amp; Restore</span><strong>Local tracker data</strong><p>Downloads your cache, layout, and preferences. TornPDA injected keys are never included.</p></div>" +
             "<label class='nat-storage-toggle' for='nat-backup-include-key'><input id='nat-backup-include-key' type='checkbox' data-action='toggle-backup-api-key'" + backupKeyChecked + "><span><strong>Include saved manual API key</strong><small>Unchecked by default. Include it only in a backup you can keep secure.</small></span></label>" +
-            "<input id='nat-backup-file' type='file' accept='application/json,.json' hidden><div class='nat-settings-actions nat-backup-actions'><button data-action='download-backup'>Download Backup</button><button class='nat-ghost-button' data-action='choose-backup'>Restore Backup</button></div>" + backupConfirmation +
+            "<input id='nat-backup-file' type='file' accept='application/json,.json' hidden><div class='nat-settings-actions nat-backup-actions'><button data-action='download-backup'" + (state.backupExportInFlight ? " disabled" : "") + ">Download Backup</button><button class='nat-ghost-button' data-action='choose-backup'>Restore Backup</button></div>" + backupConfirmation +
             (state.error ? "<div class='nat-error'>" + escapeHtml(state.error) + "</div>" : "") +
             "<div class='nat-settings-actions'><button data-action='native-reminder'>Remind Me at Next Refresh</button><button class='nat-theme-button' data-action='toggle-theme'>Use " + (state.theme === "dark" ? "Light" : "Dark") + " Mode</button></div></section>";
     }
@@ -1136,8 +1139,35 @@
         const stamp = [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("");
         return "naughty-awards-backup-v" + BACKUP_SCHEMA_VERSION + "-" + stamp + ".json";
     }
-    function downloadBackupPayload(payload) {
+    function utf8Base64(text) {
+        if (typeof TextEncoder !== "function" || typeof btoa !== "function") return "";
+        const bytes = new TextEncoder().encode(String(text));
+        let binary = "";
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+            const limit = Math.min(bytes.length, offset + 0x8000);
+            for (let index = offset; index < limit; index += 1) binary += String.fromCharCode(bytes[index]);
+        }
+        return btoa(binary);
+    }
+    async function shareTextWithTornPDA(text, fileName) {
+        if (!state.runtime.confirmed) await confirmTornPdaRuntime();
+        if (!state.runtime.isTornPDA || !isTornPdaBridgeAvailable()) return { native: false, shared: false };
+        const base64Data = utf8Base64(text);
+        if (!base64Data) return { native: true, shared: false, message: "This runtime could not encode the backup." };
+        try {
+            const response = await window.flutter_inappwebview.callHandler("shareFile", { base64Data, fileName });
+            if (response?.status === "success") return { native: true, shared: true };
+            return { native: true, shared: false, message: String(response?.message || "TornPDA could not open its share sheet.") };
+        } catch (error) {
+            logError("Native backup share failed", { fileName }, error);
+            return { native: true, shared: false, message: "TornPDA could not open its share sheet." };
+        }
+    }
+    async function downloadBackupPayload(payload) {
         const serialized = serializeBackupPayload(payload);
+        const share = await shareTextWithTornPDA(serialized, backupFilename());
+        if (share.native && !share.shared) throw new Error(share.message || "TornPDA could not open its share sheet.");
+        if (share.shared) return { transport: "share" };
         const blob = new Blob([serialized], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
@@ -1148,6 +1178,7 @@
         anchor.click();
         anchor.remove();
         window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        return { transport: "download" };
     }
     async function readBackupFile(file) {
         if (!file || !Number.isFinite(file.size) || file.size < 1 || file.size > BACKUP_MAX_BYTES) throw new Error("Invalid backup");
@@ -1386,14 +1417,21 @@
         content.querySelector("[data-action='toggle-backup-api-key']")?.addEventListener("change", (event) => {
             state.backupIncludeApiKey = Boolean(event.currentTarget.checked);
         });
-        content.querySelector("[data-action='download-backup']")?.addEventListener("click", () => {
+        content.querySelector("[data-action='download-backup']")?.addEventListener("click", async () => {
+            if (state.backupExportInFlight) return;
+            const payload = createBackupPayload(state.backupIncludeApiKey);
+            state.backupExportInFlight = true;
+            render();
             try {
-                downloadBackupPayload(createBackupPayload(state.backupIncludeApiKey));
+                const result = await downloadBackupPayload(payload);
                 state.error = "";
-                showToast("Backup downloaded.", "green");
-            } catch {
-                state.error = "Backup could not be created.";
-                showToast("Backup could not be created.", "red");
+                showToast(result.transport === "share" ? "Backup opened in the TornPDA share sheet." : "Backup downloaded.", "green");
+            } catch (error) {
+                state.error = safeDiagnosticError(error) || "Backup could not be created.";
+                showToast(state.error, "red");
+                render();
+            } finally {
+                state.backupExportInFlight = false;
                 render();
             }
         });

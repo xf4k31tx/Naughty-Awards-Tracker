@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest a focused improvement to Naughty Awards Tracker.
+title: "feature: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please describe the player problem first. Do not include API keys, private account data, or requests that would bypass Torn rules or API terms.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What player problem would this solve?
+      description: Explain the need or workflow, not only the implementation.
+      placeholder: I cannot quickly compare the nearest incomplete honors after filtering by rarity.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the intended result, including how it should work on desktop and TornPDA if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or simpler approaches have you tried?
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Main area
+      options:
+        - Award planning or collection data
+        - Desktop layout or accessibility
+        - TornPDA or mobile behavior
+        - Storage, backup, or restore
+        - Documentation or tests
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and feature requests.
+          required: true
+        - label: This request does not require sharing a Torn API key or private account data.
+          required: true

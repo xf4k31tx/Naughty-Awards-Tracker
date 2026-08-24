@@ -1,0 +1,73 @@
+name: Bug report
+description: Report reproducible behavior that differs from the expected Awards Tracker experience.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Naughty Awards Tracker. Do not include Torn API keys, cookies, account details, or unredacted backup files. Report security-sensitive issues privately under the repository Security tab instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Briefly describe the actual behavior and why it is a problem.
+      placeholder: The Honors search field clears after switching collection views.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest reliable sequence of actions.
+      placeholder: |
+        1. Open the Awards page.
+        2. Select Honors.
+        3. Enter a search term.
+        4. Switch to Completed and back.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      options:
+        - Tampermonkey on desktop browser
+        - TornPDA on Android
+        - TornPDA on iOS
+        - Other / unknown
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Script version
+      description: Find it in the userscript header or Settings.
+      placeholder: v1.3.9
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Device and display details
+      description: Include browser/app version, operating system, and portrait/landscape or approximate screen width when relevant.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted logs or screenshots
+      description: Paste redacted Console output or drag in screenshots. Replace keys and account details with [redacted].
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and did not find the same report.
+          required: true
+        - label: I removed API keys, cookies, account data, and unredacted backups.
+          required: true
