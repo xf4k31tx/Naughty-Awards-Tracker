@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const test = require("node:test");
 const vm = require("node:vm");
 
 const file = path.join(__dirname, "Naughty Awards Tracker.user.js");
@@ -10,10 +11,10 @@ const source = fs.readFileSync(file, "utf8");
 const readme = fs.readFileSync(path.join(__dirname, "README.md"), "utf8");
 const instrumented = source.replace(
     /    detectRuntimeAtStartup\(\);[\s\S]*?\n\}\)\(\);\s*$/,
-    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize };\n})();\n"
+    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, parseBackupPayload };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
-assert.match(source, /@version\s+1\.3\.5/, "Userscript metadata must reflect the responsive-layout release");
+assert.match(source, /@version\s+1\.3\.8/, "Userscript metadata must reflect the native/persistence release");
 assert.match(source, /data-corner='bottom-left'[^>]*aria-label='Resize window from the bottom-left corner/, "Bottom-left resize control must remain accessible");
 assert.match(source, /data-corner='bottom-right'[^>]*aria-label='Resize window from the bottom-right corner/, "Bottom-right resize control must remain accessible");
 assert.match(source, /querySelectorAll\("\.nat-resize"\)\.forEach\(\(handle\) => handle\.addEventListener\("keydown"/, "Resize controls must retain keyboard support");
@@ -33,16 +34,54 @@ assert.match(source, /@container \(max-width:430px\)\{[^}]*\.nat-refresh\{flex-w
 assert.match(source, /@container \(max-width:430px\)[\s\S]*?\.nat-award-row\{grid-template-columns:4px minmax\(0,1fr\)/, "Compact award rows must remove their fixed trailing column");
 assert.match(source, /#nat-body\{overflow-x:clip;overflow-y:auto\}/, "The content region must never offer horizontal scrolling");
 assert.match(readme, /safe-area-adjusted bounds/, "README must document the responsive panel clamp");
+assert.match(source, /<span>Screen Size<\/span><strong data-screen-size>/, "Settings must show the live screen size");
+assert.match(source, /<span>Storage Method<\/span><strong data-storage-method>/, "Settings must show the active storage method");
+assert.match(source, /data-action='toggle-legacy-storage'/, "Settings must expose the legacy GM storage switch");
+assert.match(source, /async function setUseLegacyGMStorage\(enabled\)/, "Legacy storage selection must perform a real storage migration");
+assert.match(source, /function createStorageAdapter\(options = \{\}\)/, "Persistence must be centralized in a storage adapter");
+assert.match(source, /const pdaSetMany = \(values\) => STORAGE_ADAPTER\.enqueue\(values\)/, "Normal saves must use the debounced storage queue");
+assert.match(source, /PDA_storage\.delete\(key\)/, "Native deletion must use TornPDA's single-key delete API");
+assert.match(source, /@grant\s+GM_deleteValue/, "Legacy delete support must be granted for Tampermonkey");
+assert.match(source, /PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_"/, "TornPDA's injected-key placeholder must remain available");
+assert.match(source, /escapeHtml\(usingInjectedKey \? "" : state\.savedApiKey\)/, "An injected key must never be placed into the settings input");
+assert.match(source, /\[STORAGE\.key\]: state\.savedApiKey \? state\.savedApiKey : STORAGE_DELETE/, "An injected key must never be persisted by the tracker");
+assert.match(source, /nativeBridgeCall\("showToast"/, "TornPDA feedback must use the native toast handler");
+assert.match(source, /nativeBridgeCall\("scheduleNotification"/, "TornPDA reminders must use the native notification handler");
+assert.match(source, /document\.addEventListener\("visibilitychange"/, "Automatic refresh must track document visibility");
+assert.match(readme, /Use legacy GM storage/, "README must document the storage preference");
 assert.match(source, /const LOG_PREFIX = "\[Naughty Awards Tracker\]";/, "Console diagnostics must retain a clear script prefix");
 assert.match(source, /function apiDiagnosticTarget\(url, method = "GET"\)/, "API logs must use a query-free target helper");
 assert.match(source, /API request started/, "API request lifecycle logs must remain available");
 assert.match(source, /Runtime confirmed/, "Runtime confirmation logs must remain available");
 assert.match(readme, /API keys, query strings, and request headers are never logged/, "README must document secret-safe Console diagnostics");
+assert.match(source, /const BACKUP_NAMESPACE = "naughty-awards-tracker\.backup";/, "Awards backups must use a tracker-specific namespace");
+assert.match(source, /function validateBackupPayload\(payload\)/, "Awards backup files must be validated before restore");
+assert.match(source, /data-action='confirm-backup-restore'/, "Awards backup restore must require a second user action");
+assert.match(source, /data-action='toggle-backup-api-key'/, "Awards backup keys must remain opt-in");
 
-const sandbox = { window: {}, document: {}, console };
+const legacyValues = new Map();
+const pdaValues = {};
+const diagnostics = [];
+const logger = Object.fromEntries(["log", "info", "debug", "warn", "error"].map((level) => [level, (...args) => diagnostics.push(args.join(" "))]));
+const sandbox = {
+    window: { setTimeout, clearTimeout }, document: { visibilityState: "visible" }, console: logger, setTimeout, clearTimeout,
+    GM: {
+        getValue: async (key, fallback) => legacyValues.has(key) ? legacyValues.get(key) : fallback,
+        setValue: async (key, value) => { legacyValues.set(key, value); }
+    },
+    PDA_storage: {
+        loadAll: async () => pdaValues,
+        setMany: async (values) => { Object.assign(pdaValues, values); },
+        delete: async (key) => { delete pdaValues[key]; }
+    }
+};
 sandbox.globalThis = sandbox;
 vm.runInNewContext(instrumented, sandbox, { filename: file });
-const { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize } = sandbox.__natTest;
+const {
+    buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize,
+    state, STORAGE, STORAGE_DELETE, createStorageAdapter, loadStoragePreference,
+    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, parseBackupPayload
+} = sandbox.__natTest;
 
 const portraitBounds = panelBounds(
     { left: 0, top: 0, width: 320, height: 480 },
@@ -84,4 +123,158 @@ assert.deepEqual(Array.from(incompleteAwardItems(summary), (item) => item.id), [
 assert.deepEqual(Array.from(filterAwardItems(incompleteAwardItems(summary), "rare"), (item) => item.name), ["Missing Link"], "Incomplete search should include rarity");
 assert.deepEqual(Array.from(filterAwardItems(summary.earned, "second catalog"), (item) => item.id), [2], "Completed search should include descriptions");
 
-console.log("Awards completion regression checks passed.");
+test("storage adapter prefers native reads and migrates a legacy value once", async () => {
+    const native = { current: "native" };
+    const legacy = new Map([["current", "legacy"], ["migrate", "legacy-only"]]);
+    const writes = [];
+    let legacyReads = 0;
+    const adapter = createStorageAdapter({
+        loadNative: async () => native,
+        readLegacy: async (key) => {
+            legacyReads += 1;
+            return legacy.has(key) ? { found: true, value: legacy.get(key) } : { found: false };
+        },
+        writeNative: async (values) => { writes.push(values); Object.assign(native, values); return true; },
+        deleteNative: async (keys) => { keys.forEach((key) => delete native[key]); return true; },
+        writeLegacy: async (values) => { Object.entries(values).forEach(([key, value]) => legacy.set(key, value)); return true; },
+        deleteLegacy: async (keys) => { keys.forEach((key) => legacy.delete(key)); return true; },
+        isLegacyPrimary: () => false,
+        schedule: () => 0,
+        cancel: () => {}
+    });
+    assert.equal(await adapter.read("current", "fallback"), "native", "Native storage must win over stale legacy data");
+    assert.equal(legacyReads, 0, "A native hit must not wait on the compatibility backend");
+    assert.equal(await adapter.read("migrate", "fallback"), "legacy-only", "Legacy data must remain readable during native adoption");
+    assert.equal(await adapter.read("migrate", "fallback"), "legacy-only", "The migrated value must read from the native cache thereafter");
+    assert.deepEqual(JSON.parse(JSON.stringify(writes)), [{ migrate: "legacy-only" }], "A legacy value must be promoted into native storage only once");
+});
+
+test("storage adapter batches queued writes and falls back after a native quota error", async () => {
+    const nativeWrites = [];
+    const legacy = new Map();
+    let nativeAttempts = 0;
+    const adapter = createStorageAdapter({
+        loadNative: async () => ({}),
+        readLegacy: async () => ({ found: false }),
+        writeNative: async (values) => { nativeWrites.push(values); return true; },
+        deleteNative: async () => true,
+        writeLegacy: async (values) => { Object.entries(values).forEach(([key, value]) => legacy.set(key, value)); return true; },
+        deleteLegacy: async () => true,
+        isLegacyPrimary: () => false,
+        schedule: () => 0,
+        cancel: () => {}
+    });
+    const first = adapter.enqueue({ first: 1 });
+    const second = adapter.enqueue({ second: 2 });
+    assert.equal(adapter.pendingCount, 2, "Queued saves must coalesce before the debounce flush");
+    assert.equal(await adapter.flushNow(), true, "The queued batch must persist successfully");
+    await Promise.all([first, second]);
+    assert.deepEqual(JSON.parse(JSON.stringify(nativeWrites)), [{ first: 1, second: 2 }], "Multiple saves in one debounce window must make one native setMany batch");
+
+    const quotaAdapter = createStorageAdapter({
+        loadNative: async () => ({}),
+        readLegacy: async () => ({ found: false }),
+        writeNative: async () => {
+            nativeAttempts += 1;
+            const error = new Error("quota");
+            error.code = "QuotaExceeded";
+            throw error;
+        },
+        deleteNative: async () => true,
+        writeLegacy: async (values) => { Object.entries(values).forEach(([key, value]) => legacy.set(key, value)); return true; },
+        deleteLegacy: async () => true,
+        isLegacyPrimary: () => false,
+        schedule: () => 0,
+        cancel: () => {}
+    });
+    const quotaFirst = quotaAdapter.enqueue({ quotaFirst: 1 });
+    assert.equal(await quotaAdapter.flushNow(), true, "Quota errors must preserve the save through legacy storage");
+    await quotaFirst;
+    const quotaSecond = quotaAdapter.enqueue({ quotaSecond: 2 });
+    assert.equal(await quotaAdapter.flushNow(), true, "Future saves must continue through the fallback after quota failure");
+    await quotaSecond;
+    assert.equal(nativeAttempts, 1, "Quota fallback must stop retrying the blocked native backend");
+    assert.equal(legacy.get("quotaFirst"), 1, "The first quota-failed value must be retained by legacy storage");
+    assert.equal(legacy.get("quotaSecond"), 2, "Later values must use the fallback safely");
+});
+
+test("storage adapter deletion clears native and legacy values without resurrection", async () => {
+    const native = { removeMe: "native" };
+    const legacy = new Map([["removeMe", "legacy"]]);
+    const adapter = createStorageAdapter({
+        loadNative: async () => native,
+        readLegacy: async (key) => legacy.has(key) ? { found: true, value: legacy.get(key) } : { found: false },
+        writeNative: async (values) => { Object.assign(native, values); return true; },
+        deleteNative: async (keys) => { keys.forEach((key) => delete native[key]); return true; },
+        writeLegacy: async (values) => { Object.entries(values).forEach(([key, value]) => legacy.set(key, value)); return true; },
+        deleteLegacy: async (keys) => { keys.forEach((key) => legacy.delete(key)); return true; },
+        isLegacyPrimary: () => false,
+        schedule: () => 0,
+        cancel: () => {}
+    });
+    const deleted = adapter.remove("removeMe");
+    assert.equal(await adapter.flushNow(), true, "Queued deletes must persist");
+    await deleted;
+    assert.equal(Object.hasOwn(native, "removeMe"), false, "Native data must be removed with PDA_storage.delete semantics");
+    assert.equal(legacy.has("removeMe"), false, "Legacy fallback data must also be removed to prevent resurrection");
+    assert.equal(await adapter.read("removeMe", "fallback"), "fallback", "A removed key must not return from either backend");
+});
+
+test("storage preference migrates current data without diagnostics leaking an API key", async () => {
+    legacyValues.clear();
+    Object.keys(pdaValues).forEach((key) => delete pdaValues[key]);
+    await loadStoragePreference();
+    assert.equal(state.useLegacyGMStorage, false, "PDA storage must remain the unchecked default");
+    state.apiKey = "nat-test-secret-key";
+    state.savedApiKey = "nat-test-secret-key";
+    state.cache = { honors: { totalEarned: 2 } };
+    state.position = { edge: "right", x: 10, y: 20 };
+    state.refreshedAt = 42;
+    assert.equal(await setUseLegacyGMStorage(true), true, "Switching to legacy storage must migrate current tracker data");
+    assert.equal(state.useLegacyGMStorage, true, "Legacy GM storage must become the active primary store");
+    assert.equal(legacyValues.get(STORAGE.key), "nat-test-secret-key", "The saved key must migrate to the selected store");
+    assert.equal(legacyValues.get(STORAGE.useLegacyGMStorage), true, "The legacy preference must persist");
+    assert.match(storageMethodLabel(), /Legacy GM storage/, "Settings must report legacy GM as the active method");
+    assert.equal(await setUseLegacyGMStorage(false), true, "Switching back must migrate current tracker data to PDA storage");
+    assert.equal(state.useLegacyGMStorage, false, "PDA storage must become the active primary store again");
+    assert.equal(pdaValues[STORAGE.key], "nat-test-secret-key", "The saved key must migrate back to PDA storage");
+    assert.equal(legacyValues.get(STORAGE.useLegacyGMStorage), false, "The unchecked preference must persist safely");
+    assert.match(storageMethodLabel(), /TornPDA PDA_storage/, "Settings must report PDA storage as the active method");
+    assert.equal(await setUseLegacyGMStorage(true), true, "Legacy storage must remain selectable before testing the desktop fallback");
+    delete sandbox.PDA_storage;
+    assert.equal(await setUseLegacyGMStorage(false), true, "Unchecking must retain GM as a safe fallback when PDA storage is unavailable");
+    assert.equal(state.useLegacyGMStorage, false, "The unchecked default must still persist without PDA storage");
+    assert.match(storageMethodLabel(), /Legacy GM storage \(fallback\)/, "Settings must identify GM as the fallback when native storage is unavailable");
+    assert.doesNotMatch(diagnostics.join("\n"), /nat-test-secret-key/, "Storage diagnostics must never expose the API key");
+});
+
+test("numeric values use comma-separated integer formatting", () => {
+    assert.equal(formatInteger(1234567.6), "1,234,568");
+    assert.match(source, /formatInteger\(viewport\.width\)/, "Screen dimensions must use integer formatting");
+    assert.match(source, /formatInteger\(width\).*formatInteger\(height\)/, "Resize feedback must use integer formatting");
+});
+
+test("backup files exclude API keys by default and reject foreign or malformed payloads", () => {
+    state.savedApiKey = "awards-local-key";
+    state.cache = null;
+    state.position = null;
+    state.refreshedAt = 0;
+    state.activeTab = "awards";
+    state.theme = "dark";
+    state.isMinimized = false;
+    state.windowSizes = {};
+    state.searchQueries = { honors: "", medals: "" };
+    state.collectionViews = { honors: "completed", medals: "completed" };
+
+    const withoutKey = createBackupPayload(false);
+    assert.equal(withoutKey.data.includesApiKey, false);
+    assert.equal(Object.hasOwn(withoutKey.data, "apiKey"), false);
+    assert.doesNotThrow(() => validateBackupPayload(withoutKey));
+
+    const withKey = createBackupPayload(true);
+    assert.equal(withKey.data.includesApiKey, true);
+    assert.equal(withKey.data.apiKey, "awards-local-key");
+    assert.equal(parseBackupPayload(JSON.stringify(withKey)).data.apiKey, "awards-local-key");
+    assert.throws(() => validateBackupPayload({ ...withoutKey, namespace: "other" }), /Invalid backup/);
+    assert.throws(() => parseBackupPayload("{bad json"), /Invalid backup/);
+});

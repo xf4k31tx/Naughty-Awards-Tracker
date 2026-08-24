@@ -10,9 +10,9 @@ Naughty Awards Tracker is a focused Torn userscript for tracking medals, honors,
 - Collection completion summaries, completion bars, earned/incomplete counts, and rarity chips.
 - Award rows with rarity color, title, description, and earned date when applicable.
 - Dark and lower-glare light themes.
-- Manual refresh plus an automatic daily refresh at 00:00 UTC.
+- Manual refresh plus an automatic daily refresh at 00:00 UTC. Automatic refresh pauses while the document/tab is inactive and safely resumes when it becomes active again.
 - Persistent API key, panel layout, theme, active tab, collection view, and search state.
-- Native TornPDA detection, safe-area handling, orientation-aware layout, and touch-friendly controls.
+- Native TornPDA detection, safe-area handling, orientation-aware layout, touch-friendly controls, toasts, and daily refresh reminders.
 
 ## Installation
 
@@ -40,7 +40,7 @@ Search state and the selected completed/incomplete view are retained locally whe
 
 ### Settings and refresh
 
-Use the settings button to save or replace the Torn API key, switch theme, inspect the detected runtime, and reset the widget layout. The refresh button reloads award and progress data immediately. A daily timer also refreshes automatically at 00:00 UTC while the script is active.
+Use the settings button to save or replace the Torn API key, switch theme, inspect the detected runtime, schedule a refresh reminder, and reset the widget layout. The refresh button reloads award and progress data immediately. A daily timer refreshes automatically at 00:00 UTC only while the script is active; inactive tabs/documents do not start background refreshes and catch up safely when restored.
 
 ## Desktop and TornPDA
 
@@ -48,9 +48,13 @@ The desktop widget is movable, resizable, and minimizable. TornPDA is detected t
 
 ## TornPDA compatibility and storage
 
-On TornPDA, `PDA_storage` is the first-choice durable, per-script store. The tracker loads that namespace once during bootstrap and batches native saves for its API key, dashboard state, position, cached award data, and refresh time. When a native key is missing, the existing GM/Tampermonkey value is copied forward automatically; an existing native value remains authoritative. If native storage is unavailable or its quota is exceeded, the tracker falls back to compatible userscript storage so the latest change is not lost.
+On TornPDA, `PDA_storage` is the first-choice durable, per-script store. The tracker loads that namespace once during bootstrap and sends ordinary saves through one short debounced queue, so nearby API-key, dashboard, position, cache, and refresh-time changes become one native `setMany` call. Native values remain authoritative; a legacy value is copied into the native store only once when its native counterpart is missing. If native storage is unavailable or its quota is exceeded, the same queued change falls back to compatible GM storage and then browser-local storage if needed. Deletions use TornPDA's native `PDA_storage.delete(key)` and clear the compatibility copy too, preventing stale values from returning.
 
-The tracker treats native identity and layout separately. It waits for `flutterInAppWebViewPlatformReady`, then verifies `isTornPDA` before treating the session as TornPDA. A confirmed native session follows the live viewport, safe areas, and orientation, with an additional compact treatment for narrow TornPDA screens; it is not inferred merely from touch capability or a small desktop window. Requests use the declared legacy/modern GM network APIs when present and use TornPDA's native `PDA_httpGet` handler only after the bridge is ready. `PDA_storage` needs no extra userscript `@grant`.
+Settings shows the current runtime, live screen size, and storage method. **Use legacy GM storage** is unchecked by default: enabling it first copies the current tracker data to GM/Tampermonkey storage, then makes that store primary; disabling it copies the current data back to `PDA_storage` when available, otherwise retains GM as the fallback. The preference is persisted separately so the chosen primary store survives restarts. Storage diagnostics never include API-key values.
+
+Settings also provides **Backup & Restore**. Download creates a versioned local JSON backup of the tracker cache, refresh timestamp, layout, collection/search preferences, theme, and storage choice. The saved manual API key is excluded by default; it can be included only by checking the explicit export option. TornPDA-injected keys are never exported. Loading accepts only a validated Awards Tracker backup, shows the pending replacement clearly, and requires a separate Restore action. A key-free backup preserves the API key already saved on the device; restoring only affects local tracker storage and never changes Torn data.
+
+The tracker treats native identity and layout separately. It waits for `flutterInAppWebViewPlatformReady`, then verifies `isTornPDA` before treating the session as TornPDA. A confirmed native session follows the live viewport, safe areas, and orientation, with an additional compact treatment for narrow TornPDA screens; it is not inferred merely from touch capability or a small desktop window. TornPDA's `###PDA-APIKEY###` injected key is adopted automatically when available, takes precedence for the active session, and is never displayed, persisted, or logged by the tracker. Native toast feedback uses `showToast`; **Remind Me at Next Refresh** uses TornPDA's native reminder when available, with a desktop in-page/browser-notification fallback while the tab remains open. Requests use the declared legacy/modern GM network APIs when present and use TornPDA's native `PDA_httpGet` handler only after the bridge is ready. `PDA_storage` needs no extra userscript `@grant`.
 
 ## Console diagnostics
 

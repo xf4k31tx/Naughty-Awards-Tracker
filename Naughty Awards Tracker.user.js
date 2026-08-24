@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.3.5
+// @version      1.3.8
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
@@ -11,22 +11,33 @@
 // @grant        GM_setValue
 // @grant        GM.getValue
 // @grant        GM.setValue
+// @grant        GM_deleteValue
+// @grant        GM.deleteValue
 // @connect      api.torn.com
 // ==/UserScript==
 
 (function () {
     "use strict";
 
-    const VERSION = "1.3.5";
+    const VERSION = "1.3.8";
     const BASE_URL = "https://api.torn.com/v2/";
+    const PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_";
+    const NATIVE_REMINDER_ID = 6324;
+    const BACKUP_NAMESPACE = "naughty-awards-tracker.backup";
+    const BACKUP_SCHEMA_VERSION = 1;
+    const BACKUP_MAX_BYTES = 8 * 1024 * 1024;
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
         dashboard: "NAT_DASHBOARD_STATE",
         position: "NAT_WIDGET_POSITION",
         cache: "NAT_AWARDS_CACHE",
-        refreshedAt: "NAT_AWARDS_REFRESHED_AT"
+        refreshedAt: "NAT_AWARDS_REFRESHED_AT",
+        useLegacyGMStorage: "NAT_USE_LEGACY_GM_STORAGE"
     };
-    const PDA_STORE = { loaded: null, values: null };
+    const PDA_STORE = { loaded: null, values: null, quotaExceeded: false };
+    const STORAGE_DELETE = Symbol("NAT_STORAGE_DELETE");
+    const STORAGE_MISSING = "__NAT_STORAGE_MISSING_V2__";
+    const STORAGE_TOMBSTONE = "__NAT_STORAGE_DELETED_V2__";
     const RARITY = {
         "Very Common": "#9ca3af",
         Common: "#cbd5e1",
@@ -47,9 +58,11 @@
         "illegal production": ["crimes", "offenses", "illegal_production"]
     };
     const state = {
-        apiKey: "", activeTab: "awards", theme: "dark", isMinimized: false,
+        apiKey: "", savedApiKey: "", apiKeySource: "saved", activeTab: "awards", theme: "dark", isMinimized: false,
         windowSizes: {}, position: null, cache: null, refreshedAt: 0,
-        dashboard: null, refreshInFlight: false, dailyTimer: null, error: "",
+        dashboard: null, refreshInFlight: false, dailyTimer: null, dailyRefreshDueAt: 0, autoRefreshQueued: false, refreshPaused: false,
+        reminderTimer: null, toastTimer: null, activityBound: false, nativeTabActive: true, nativeTabVisible: true,
+        backupIncludeApiKey: false, pendingBackup: null, restoreInFlight: false, error: "", useLegacyGMStorage: false,
         searchQueries: { honors: "", medals: "" }, collectionViews: { honors: "completed", medals: "completed" }, searchSaveTimer: null,
         runtime: {
             isTornPDA: false,
@@ -129,6 +142,90 @@
             throw error;
         }
     }
+    function nativeErrorCategory(error) {
+        if (error?.code === "QuotaExceeded") return "QuotaExceeded";
+        if (error?.name === "AbortError") return "AbortError";
+        return "unavailable";
+    }
+    function nativeBridgeCall(handler, payload) {
+        if (!state.runtime.isTornPDA || !state.runtime.confirmed || !isTornPdaBridgeAvailable()) {
+            return Promise.reject(new Error("TornPDA native handler is unavailable."));
+        }
+        return window.flutter_inappwebview.callHandler(handler, payload);
+    }
+    function injectedPdaApiKey() {
+        const key = String(PDA_INJECTED_API_KEY || "").trim();
+        return key && key !== "_###PDA-APIKEY###_" ? key : "";
+    }
+    function adoptInjectedPdaApiKey() {
+        const key = state.runtime.isTornPDA && state.runtime.confirmed ? injectedPdaApiKey() : "";
+        if (!key) return false;
+        state.apiKey = key;
+        state.apiKeySource = "tornpda";
+        return true;
+    }
+    function nativeToast(text, tone = "blue") {
+        if (!text || !state.runtime.isTornPDA || !state.runtime.confirmed) return;
+        const colors = {
+            blue: { a: 255, r: 28, g: 86, b: 136 },
+            green: { a: 255, r: 25, g: 109, b: 81 },
+            red: { a: 255, r: 135, g: 51, b: 61 }
+        };
+        void nativeBridgeCall("showToast", {
+            text: String(text), clickClose: true, seconds: 4,
+            bgColor: colors[tone] || colors.blue,
+            textColor: { a: 255, r: 255, g: 255, b: 255 }
+        }).catch((error) => logDebug("Native toast unavailable", { category: nativeErrorCategory(error) }));
+    }
+    function showToast(text, tone = "blue") {
+        const message = String(text || "").trim();
+        if (!message) return;
+        const toast = state.dashboard?.querySelector("#nat-toast");
+        if (toast) {
+            toast.textContent = message;
+            toast.dataset.tone = tone;
+            toast.hidden = false;
+            clearTimeout(state.toastTimer);
+            state.toastTimer = window.setTimeout(() => {
+                if (toast.textContent === message) toast.hidden = true;
+            }, 4200);
+        }
+        nativeToast(message, tone);
+    }
+    function nextDailyRefreshAt(now = Date.now()) {
+        const date = new Date(now);
+        return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1) + 250;
+    }
+    function scheduleDesktopReminder(timestamp) {
+        clearTimeout(state.reminderTimer);
+        const delay = Math.max(1000, timestamp - Date.now());
+        state.reminderTimer = window.setTimeout(() => {
+            try {
+                if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+                    new Notification("Naughty Awards Tracker", { body: "Your awards snapshot is ready to refresh." });
+                }
+            } catch {}
+            showToast("Awards refresh reminder.", "blue");
+        }, delay);
+        return timestamp;
+    }
+    async function scheduleRefreshReminder() {
+        const timestamp = state.dailyRefreshDueAt > Date.now() ? state.dailyRefreshDueAt : nextDailyRefreshAt();
+        if (!state.runtime.isTornPDA || !state.runtime.confirmed) return { native: false, timestamp: scheduleDesktopReminder(timestamp) };
+        await nativeBridgeCall("scheduleNotification", {
+            title: "Naughty Awards Tracker",
+            subtitle: "Your awards snapshot is ready to refresh.",
+            id: NATIVE_REMINDER_ID,
+            timestamp,
+            overwriteID: true,
+            launchNativeToast: true,
+            toastMessage: "Awards refresh reminder scheduled.",
+            toastColor: "green",
+            toastDurationSeconds: 4,
+            urlCallback: "https://www.torn.com/page.php?sid=awards"
+        });
+        return { native: true, timestamp };
+    }
     function runtimeLabel() {
         if (!state.runtime.isTornPDA) return "Desktop browser";
         return state.runtime.confirmed ? "TornPDA" : "TornPDA · verifying";
@@ -137,6 +234,21 @@
         return state.runtime.isTornPDA
             ? "Native TornPDA bridge detected. The panel follows your active device viewport."
             : "Standard desktop browser layout is active.";
+    }
+    function screenSizeLabel() {
+        const viewport = getViewportMetrics();
+        return formatInteger(viewport.width) + " × " + formatInteger(viewport.height) + " px · " + viewport.orientation;
+    }
+    function storageMethodLabel() {
+        if (state.useLegacyGMStorage) return "Legacy GM storage (primary)";
+        if (PDA_STORE.quotaExceeded) return "Legacy GM storage (PDA_storage quota fallback)";
+        return hasPdaStorage() && PDA_STORE.values ? "TornPDA PDA_storage (primary)" : "Legacy GM storage (fallback)";
+    }
+    function storageMethodDescription() {
+        if (state.useLegacyGMStorage) return "Selected by preference. Legacy GM storage is primary; TornPDA storage remains a recovery fallback.";
+        if (PDA_STORE.quotaExceeded) return "TornPDA storage is full, so compatible GM/local storage is keeping new changes safe.";
+        if (hasPdaStorage() && PDA_STORE.values) return "Default: TornPDA PDA_storage is primary, with legacy GM storage as a fallback.";
+        return "TornPDA storage is unavailable, so legacy GM storage is currently the fallback.";
     }
     function updateRuntimeLayout() {
         const dashboard = state.dashboard;
@@ -152,8 +264,14 @@
         dashboard.style.setProperty("--nat-panel-max-height", Math.max(1, Math.floor(bounds.height)) + "px");
         const label = dashboard.querySelector("[data-runtime-label]");
         const detail = dashboard.querySelector("[data-runtime-detail]");
+        const screen = dashboard.querySelector("[data-screen-size]");
+        const storage = dashboard.querySelector("[data-storage-method]");
+        const storageDetail = dashboard.querySelector("[data-storage-detail]");
         if (label) label.textContent = runtimeLabel();
         if (detail) detail.textContent = runtimeDescription();
+        if (screen) screen.textContent = screenSizeLabel();
+        if (storage) storage.textContent = storageMethodLabel();
+        if (storageDetail) storageDetail.textContent = storageMethodDescription();
     }
     async function confirmTornPdaRuntime() {
         if (!(await waitForPdaBridge())) {
@@ -171,8 +289,11 @@
             logWarn("TornPDA runtime confirmation failed; using desktop mode", { error: safeDiagnosticError(error) });
         } finally {
             state.runtime.confirmed = true;
+            const adoptedInjectedKey = state.runtime.isTornPDA && adoptInjectedPdaApiKey();
             updateRuntimeLayout();
             if (state.dashboard) state.isMinimized ? applyPosition() : applySize();
+            if (state.runtime.isTornPDA) void refreshNativeTabState();
+            if (adoptedInjectedKey && state.dashboard) render();
             logInfo("Runtime confirmed", {
                 runtime: state.runtime.isTornPDA ? "TornPDA" : "desktop",
                 bridge: isTornPdaBridgeAvailable(),
@@ -272,56 +393,321 @@
                 PDA_STORE.values = values && typeof values === "object" ? values : {};
                 logDebug("TornPDA storage loaded", { keys: Object.keys(PDA_STORE.values).length });
                 return PDA_STORE.values;
-            }).catch((error) => {
-                logWarn("TornPDA storage unavailable; using userscript storage", { error: safeDiagnosticError(error) });
+            }).catch(() => {
+                logWarn("TornPDA storage unavailable; using userscript storage", { category: "unavailable" });
                 PDA_STORE.values = null;
                 return null;
             });
         }
         return PDA_STORE.loaded;
     }
-    async function legacyGet(key, fallback) {
+    function localGetValue(key, fallback) {
         try {
-            if (typeof GM !== "undefined" && typeof GM.getValue === "function") return await GM.getValue(key, fallback);
-            if (typeof GM_getValue === "function") return await Promise.resolve(GM_getValue(key, fallback));
+            const raw = window.localStorage?.getItem(key);
+            return raw === null || raw === undefined ? fallback : JSON.parse(raw);
         } catch {}
         return fallback;
     }
-    async function gmGet(key, fallback) {
-        const values = await loadPdaStorage();
-        if (values && Object.prototype.hasOwnProperty.call(values, key)) return values[key];
-        const value = await legacyGet(key, fallback);
-        if (values) await pdaSetMany({ [key]: value });
-        return value;
+    function localSetValue(key, value) {
+        try {
+            window.localStorage?.setItem(key, JSON.stringify(value));
+            return true;
+        } catch {}
+        return false;
     }
-    function legacySet(key, value) {
+    function localDeleteValue(key) {
+        try {
+            window.localStorage?.removeItem(key);
+            return true;
+        } catch {}
+        return false;
+    }
+    async function legacyGet(key, fallback) {
+        try {
+            if (typeof GM !== "undefined" && typeof GM.getValue === "function") {
+                const value = await GM.getValue(key, STORAGE_MISSING);
+                if (value === STORAGE_TOMBSTONE) return fallback;
+                if (value !== STORAGE_MISSING && value !== undefined) return value;
+            }
+        } catch {}
+        try {
+            if (typeof GM_getValue === "function") {
+                const value = await Promise.resolve(GM_getValue(key, STORAGE_MISSING));
+                if (value === STORAGE_TOMBSTONE) return fallback;
+                if (value !== STORAGE_MISSING && value !== undefined) return value;
+            }
+        } catch {}
+        return localGetValue(key, fallback);
+    }
+    async function legacyRead(key) {
+        const value = await legacyGet(key, STORAGE_MISSING);
+        return value === STORAGE_MISSING ? { found: false, value: undefined } : { found: true, value };
+    }
+    async function legacySetValue(key, value) {
         try {
             if (typeof GM !== "undefined" && typeof GM.setValue === "function") {
-                void Promise.resolve(GM.setValue(key, value)).catch(() => {});
-                return;
+                await Promise.resolve(GM.setValue(key, value));
+                return true;
             }
-            if (typeof GM_setValue === "function") GM_setValue(key, value);
         } catch {}
+        try {
+            if (typeof GM_setValue === "function") {
+                await Promise.resolve(GM_setValue(key, value));
+                return true;
+            }
+        } catch {}
+        return localSetValue(key, value);
     }
-    async function pdaSetMany(values) {
+    async function legacyDeleteValue(key) {
+        try {
+            if (typeof GM !== "undefined" && typeof GM.deleteValue === "function") {
+                await Promise.resolve(GM.deleteValue(key));
+                return true;
+            }
+        } catch {}
+        try {
+            if (typeof GM_deleteValue === "function") {
+                await Promise.resolve(GM_deleteValue(key));
+                return true;
+            }
+        } catch {}
+        try {
+            if (typeof GM !== "undefined" && typeof GM.setValue === "function") {
+                await Promise.resolve(GM.setValue(key, STORAGE_TOMBSTONE));
+                return true;
+            }
+            if (typeof GM_setValue === "function") {
+                await Promise.resolve(GM_setValue(key, STORAGE_TOMBSTONE));
+                return true;
+            }
+        } catch {}
+        return localDeleteValue(key);
+    }
+    async function legacySetMany(values) {
+        const entries = Object.entries(values || {});
+        if (!entries.length) return true;
+        const saved = (await Promise.all(entries.map(([key, value]) => legacySetValue(key, value)))).every(Boolean);
+        if (saved) logDebug("Userscript storage saved", { keys: entries.length });
+        else logWarn("Userscript storage write failed", { keys: entries.length });
+        return saved;
+    }
+    async function legacyDeleteMany(keys) {
+        const uniqueKeys = [...new Set((keys || []).map(String).filter(Boolean))];
+        if (!uniqueKeys.length) return true;
+        const deleted = (await Promise.all(uniqueKeys.map(legacyDeleteValue))).every(Boolean);
+        if (deleted) logDebug("Userscript storage deleted", { keys: uniqueKeys.length });
+        else logWarn("Userscript storage delete failed", { keys: uniqueKeys.length });
+        return deleted;
+    }
+    async function writePdaValues(values) {
+        const entries = Object.entries(values || {});
+        if (!entries.length) return true;
         const stored = await loadPdaStorage();
-        if (!stored || !hasPdaStorage()) {
-            logDebug("Storage save using userscript fallback", { keys: Object.keys(values || {}).length });
-            Object.entries(values).forEach(([key, value]) => legacySet(key, value));
-            return;
-        }
+        if (!stored || !hasPdaStorage() || PDA_STORE.quotaExceeded) return false;
         try {
             await PDA_storage.setMany(values);
             Object.assign(stored, values);
-            logDebug("TornPDA storage saved", { keys: Object.keys(values || {}).length });
+            logDebug("TornPDA storage saved", { keys: entries.length });
+            return true;
         } catch (error) {
-            if (error?.code === "QuotaExceeded") logWarn("TornPDA storage quota exceeded; using userscript storage", { keys: Object.keys(values || {}).length });
-            else logWarn("TornPDA storage write failed; using userscript storage", { keys: Object.keys(values || {}).length, error: safeDiagnosticError(error) });
-            Object.entries(values).forEach(([key, value]) => legacySet(key, value));
+            if (error?.code === "QuotaExceeded") {
+                PDA_STORE.quotaExceeded = true;
+                logWarn("TornPDA storage quota exceeded; using userscript storage", { keys: entries.length, category: "QuotaExceeded" });
+            } else logWarn("TornPDA storage write failed; using userscript storage", { keys: entries.length, category: nativeErrorCategory(error) });
+            return false;
         }
     }
+    async function deletePdaValues(keys) {
+        const uniqueKeys = [...new Set((keys || []).map(String).filter(Boolean))];
+        if (!uniqueKeys.length) return true;
+        const stored = await loadPdaStorage();
+        if (!stored || !hasPdaStorage() || typeof PDA_storage.delete !== "function") return false;
+        try {
+            await Promise.all(uniqueKeys.map((key) => PDA_storage.delete(key)));
+            uniqueKeys.forEach((key) => delete stored[key]);
+            logDebug("TornPDA storage deleted", { keys: uniqueKeys.length });
+            return true;
+        } catch (error) {
+            logWarn("TornPDA storage delete failed; using userscript storage", { keys: uniqueKeys.length, category: nativeErrorCategory(error) });
+            return false;
+        }
+    }
+    function createStorageAdapter(options = {}) {
+        const pending = new Map();
+        const migrated = new Set();
+        const waiters = [];
+        const debounceMs = Math.max(0, Number(options.debounceMs) || 140);
+        const schedule = options.schedule || ((callback, delay) => window.setTimeout(callback, delay));
+        const cancel = options.cancel || ((timer) => clearTimeout(timer));
+        let timer = null;
+        let flushing = null;
+        let nativeBlocked = false;
+        const own = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+        const normalize = (changes) => {
+            const values = {};
+            const deletes = [];
+            Object.entries(changes || {}).forEach(([key, value]) => {
+                if (!key) return;
+                if (value === STORAGE_DELETE) deletes.push(key);
+                else values[key] = value;
+            });
+            return { values, deletes: [...new Set(deletes)] };
+        };
+        const empty = (batch) => !Object.keys(batch.values).length && !batch.deletes.length;
+        const call = async (operation, nativeOperation, ...args) => {
+            if (typeof operation !== "function") return false;
+            try { return (await operation(...args)) !== false; }
+            catch (error) {
+                if (nativeOperation && error?.code === "QuotaExceeded") nativeBlocked = true;
+                return false;
+            }
+        };
+        const nativeWrite = async (values) => {
+            if (!Object.keys(values).length) return true;
+            if (nativeBlocked || options.isNativeBlocked?.()) return false;
+            const saved = await call(options.writeNative, true, values);
+            if (!saved && options.isNativeBlocked?.()) nativeBlocked = true;
+            return saved;
+        };
+        const nativeDelete = async (keys) => !keys.length || call(options.deleteNative, true, keys);
+        const legacyWrite = async (values) => !Object.keys(values).length || call(options.writeLegacy, false, values);
+        const legacyDelete = async (keys) => !keys.length || call(options.deleteLegacy, false, keys);
+        const persistTo = async (backend, batch) => {
+            const write = backend === "legacy" ? legacyWrite : nativeWrite;
+            const remove = backend === "legacy" ? legacyDelete : nativeDelete;
+            return (await write(batch.values)) && (await remove(batch.deletes));
+        };
+        const persist = async (batch, legacyPrimary = Boolean(options.isLegacyPrimary?.())) => {
+            if (empty(batch)) return true;
+            let saved = true;
+            if (Object.keys(batch.values).length) {
+                saved = legacyPrimary ? await legacyWrite(batch.values) : await nativeWrite(batch.values);
+                if (!saved) saved = legacyPrimary ? await nativeWrite(batch.values) : await legacyWrite(batch.values);
+            }
+            if (!batch.deletes.length) return saved;
+            const [nativeDeleted, legacyDeleted, nativeValues] = await Promise.all([
+                nativeDelete(batch.deletes), legacyDelete(batch.deletes), Promise.resolve(options.loadNative?.()).catch(() => null)
+            ]);
+            return saved && (nativeValues ? nativeDeleted : legacyDeleted);
+        };
+        const scheduleFlush = () => {
+            if (timer !== null || flushing || !pending.size) return;
+            timer = schedule(() => {
+                timer = null;
+                void flush();
+            }, debounceMs);
+        };
+        async function flush() {
+            if (flushing) return flushing;
+            if (!pending.size) return true;
+            if (timer !== null) {
+                cancel(timer);
+                timer = null;
+            }
+            const changes = Object.fromEntries(pending);
+            pending.clear();
+            const batchWaiters = waiters.splice(0);
+            flushing = Promise.resolve(persist(normalize(changes))).catch(() => false);
+            const saved = await flushing;
+            flushing = null;
+            batchWaiters.forEach((resolve) => resolve(saved));
+            scheduleFlush();
+            return saved;
+        }
+        async function flushNow() {
+            if (timer !== null) {
+                cancel(timer);
+                timer = null;
+            }
+            let saved = true;
+            while (flushing || pending.size) saved = (await flush()) && saved;
+            return saved;
+        }
+        const enqueue = (changes) => {
+            const batch = normalize(changes);
+            if (empty(batch)) return Promise.resolve(true);
+            Object.entries(batch.values).forEach(([key, value]) => pending.set(key, value));
+            batch.deletes.forEach((key) => pending.set(key, STORAGE_DELETE));
+            const completion = new Promise((resolve) => waiters.push(resolve));
+            scheduleFlush();
+            return completion;
+        };
+        const read = async (key, fallback) => {
+            let nativeValues = null;
+            try { nativeValues = await options.loadNative?.(); } catch {}
+            const nativeFound = Boolean(nativeValues && own(nativeValues, key));
+            if (!options.isLegacyPrimary?.() && nativeFound) return nativeValues[key];
+            const legacy = await options.readLegacy(key);
+            if (options.isLegacyPrimary?.()) {
+                if (legacy.found) return legacy.value;
+                if (nativeFound) {
+                    const migrationKey = "legacy:" + key;
+                    if (!migrated.has(migrationKey)) {
+                        migrated.add(migrationKey);
+                        await persistTo("legacy", normalize({ [key]: nativeValues[key] }));
+                    }
+                    return nativeValues[key];
+                }
+                return fallback;
+            }
+            if (legacy.found) {
+                const migrationKey = "native:" + key;
+                if (nativeValues && !migrated.has(migrationKey)) {
+                    migrated.add(migrationKey);
+                    await persist(normalize({ [key]: legacy.value }), false);
+                }
+                return legacy.value;
+            }
+            return fallback;
+        };
+        const writeImmediately = async (changes, configuration = {}) => {
+            if (!(await flushNow())) return false;
+            return persist(normalize(changes), configuration.legacyPrimary);
+        };
+        const writeEverywhere = async (changes) => {
+            if (!(await flushNow())) return { native: false, legacy: false };
+            const batch = normalize(changes);
+            return {
+                native: await persistTo("native", batch),
+                legacy: await persistTo("legacy", batch)
+            };
+        };
+        return {
+            read, enqueue, flush, flushNow, writeImmediately, writeEverywhere,
+            remove: (key) => enqueue({ [key]: STORAGE_DELETE }),
+            get pendingCount() { return pending.size; },
+            get migrationCount() { return migrated.size; },
+            get nativeBlocked() { return nativeBlocked || Boolean(options.isNativeBlocked?.()); }
+        };
+    }
+    const STORAGE_ADAPTER = createStorageAdapter({
+        debounceMs: 160,
+        loadNative: loadPdaStorage,
+        readLegacy: legacyRead,
+        writeNative: writePdaValues,
+        deleteNative: deletePdaValues,
+        writeLegacy: legacySetMany,
+        deleteLegacy: legacyDeleteMany,
+        isLegacyPrimary: () => state.useLegacyGMStorage,
+        isNativeBlocked: () => PDA_STORE.quotaExceeded
+    });
+    async function loadStoragePreference() {
+        const legacy = await legacyRead(STORAGE.useLegacyGMStorage);
+        if (legacy.found && typeof legacy.value === "boolean") {
+            state.useLegacyGMStorage = legacy.value;
+            return;
+        }
+        const values = await loadPdaStorage();
+        state.useLegacyGMStorage = values?.[STORAGE.useLegacyGMStorage] === true;
+    }
+    const gmGet = (key, fallback) => STORAGE_ADAPTER.read(key, fallback);
+    const pdaSetMany = (values) => STORAGE_ADAPTER.enqueue(values);
+    const pdaDelete = (key) => STORAGE_ADAPTER.remove(key);
     function gmSet(key, value) {
         void pdaSetMany({ [key]: value });
+    }
+    function gmDelete(key) {
+        void pdaDelete(key);
     }
     function requestJson(url) {
         return new Promise((resolve, reject) => {
@@ -377,7 +763,7 @@
             const id = Number(item?.id);
             if (!Number.isInteger(id) || id < 1 || byId.has(id)) return;
             byId.set(id, {
-                id, name: String(item?.name || fallback + " #" + id),
+                id, name: String(item?.name || fallback + " #" + formatInteger(id)),
                 description: String(item?.description || ""), rarity: String(item?.rarity || "Unknown")
             });
         });
@@ -390,7 +776,7 @@
         });
         const catalog = [...byId.values()].sort((a, b) => a.id - b.id);
         const earned = [...earnedById.entries()].map(([id, timestamp]) => {
-            const metadata = byId.get(id) || { id, name: fallback + " #" + id, description: "", rarity: "Unknown" };
+            const metadata = byId.get(id) || { id, name: fallback + " #" + formatInteger(id), description: "", rarity: "Unknown" };
             return { ...metadata, timestamp };
         }).sort((a, b) => b.timestamp - a.timestamp || a.name.localeCompare(b.name));
         const rarity = earned.reduce((result, item) => {
@@ -424,17 +810,69 @@
             .map((track) => {
                 const current = getNestedNumber(personalstats, track.path);
                 return {
-                    name: track.award.name || track.type + " #" + track.id,
+                    name: track.award.name || track.type + " #" + formatInteger(track.id),
                     description: track.award.description || "", rarity: track.award.rarity || "Unknown",
                     type: track.type, current, target: track.target, percent: Math.min(100, current / track.target * 100)
                 };
             }).filter((track) => track.current < track.target)
             .sort((a, b) => b.percent - a.percent || a.target - b.target).slice(0, 5);
     }
-    async function refreshAwards() {
+    function isTrackerActive() {
+        return document.visibilityState !== "hidden" && (!state.runtime.isTornPDA || (state.nativeTabActive && state.nativeTabVisible));
+    }
+    function pauseAutomaticRefresh() {
+        clearTimeout(state.dailyTimer);
+        state.dailyTimer = null;
+        state.refreshPaused = true;
+    }
+    function resumeAutomaticRefresh() {
+        if (!isTrackerActive()) return;
+        const dueAt = Number(state.dailyRefreshDueAt || 0);
+        state.refreshPaused = false;
+        if (state.autoRefreshQueued || (dueAt && Date.now() >= dueAt)) {
+            state.autoRefreshQueued = false;
+            if (!state.isMinimized) void refreshAwards({ automatic: true }).finally(scheduleDailyRefresh);
+            else scheduleDailyRefresh();
+            return;
+        }
+        armDailyRefresh(dueAt > Date.now() ? dueAt : nextDailyRefreshAt());
+    }
+    function updateTrackerActivity(next = {}) {
+        const wasActive = isTrackerActive();
+        if (typeof next.isActiveTab === "boolean") state.nativeTabActive = next.isActiveTab;
+        if (typeof next.isWebViewVisible === "boolean") state.nativeTabVisible = next.isWebViewVisible;
+        const active = isTrackerActive();
+        if (!active) pauseAutomaticRefresh();
+        else if (!wasActive || state.refreshPaused) resumeAutomaticRefresh();
+        return active;
+    }
+    async function refreshNativeTabState() {
+        if (!state.runtime.isTornPDA || !state.runtime.confirmed) return;
+        try {
+            updateTrackerActivity(await nativeBridgeCall("PDA_getTabState"));
+        } catch (error) {
+            logDebug("Native tab-state check unavailable", { category: nativeErrorCategory(error) });
+        }
+    }
+    function bindActivityLifecycle() {
+        if (state.activityBound) return;
+        state.activityBound = true;
+        document.addEventListener("visibilitychange", () => updateTrackerActivity());
+        window.addEventListener("tornpda:tabState", (event) => updateTrackerActivity(event.detail || {}));
+        window.addEventListener("pagehide", () => void STORAGE_ADAPTER.flushNow());
+        void refreshNativeTabState();
+    }
+    async function refreshAwards(options = {}) {
+        const automatic = options.automatic === true;
+        if (automatic && !isTrackerActive()) {
+            state.autoRefreshQueued = true;
+            pauseAutomaticRefresh();
+            logDebug("Automatic awards refresh paused", { reason: "inactive-tab" });
+            return false;
+        }
         if (!state.apiKey || state.refreshInFlight || state.isMinimized) {
             logDebug("Awards refresh skipped", { hasApiKey: Boolean(state.apiKey), inFlight: state.refreshInFlight, minimized: state.isMinimized });
-            return;
+            return false;
         }
         state.refreshInFlight = true;
         state.error = "";
@@ -462,14 +900,17 @@
             };
             state.refreshedAt = Date.now();
             void pdaSetMany({ [STORAGE.cache]: state.cache, [STORAGE.refreshedAt]: state.refreshedAt });
+            if (!automatic) showToast("Awards refreshed.", "green");
         } catch (error) {
             state.error = error.message || "Unable to refresh awards";
             logError("Awards refresh failed", { durationMs: Date.now() - startedAt }, error);
+            showToast("Awards refresh failed. See the tracker for details.", "red");
         } finally {
             state.refreshInFlight = false;
             if (!state.error) logInfo("Awards refresh completed", { durationMs: Date.now() - startedAt, medals: state.cache?.medals?.totalEarned || 0, honors: state.cache?.honors?.totalEarned || 0 });
             render();
         }
+        return !state.error;
     }
 
     function rarityChips(summary) {
@@ -584,18 +1025,203 @@
         return "<div class='nat-grid nat-awards-main'>" + progressCard(state.cache.progress) + "</div>";
     }
     function settingsView() {
+        const legacyChecked = state.useLegacyGMStorage ? " checked" : "";
+        const usingInjectedKey = state.apiKeySource === "tornpda";
+        const backupKeyChecked = state.backupIncludeApiKey ? " checked" : "";
+        const backupPending = state.pendingBackup;
+        const backupConfirmation = backupPending ? "<div class='nat-backup-confirm' role='status'><strong>Restore " + escapeHtml(backupPending.filename) + "?</strong><p>This replaces the tracker cache, layout, and preferences" + (backupPending.payload.data.includesApiKey ? ", including its saved manual API key." : ". Your current saved API key stays unchanged.") + "</p><div class='nat-settings-actions'><button data-action='confirm-backup-restore'" + (state.restoreInFlight ? " disabled" : "") + ">" + (state.restoreInFlight ? "Restoring…" : "Restore Backup Now") + "</button><button class='nat-ghost-button' data-action='cancel-backup-restore'" + (state.restoreInFlight ? " disabled" : "") + ">Cancel</button></div></div>" : "";
         return "<section class='nat-card nat-settings'><div class='nat-card-header'><div><span class='nat-eyebrow'>Tracker preferences</span><h2>Settings</h2></div><button class='nat-ghost-button' data-tab='awards'>Awards</button></div><label for='nat-api-key'>Torn API Key</label>" +
-            "<div class='nat-key-row'><input id='nat-api-key' type='password' autocomplete='off' value='" + escapeHtml(state.apiKey) +
-            "' placeholder='Enter Torn API key'><button data-action='save-key'>Save Key</button></div>" +
-            "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:00 UTC</strong><p>Manual refresh remains available whenever you need a new snapshot.</p></div>" +
+            "<div class='nat-key-row'><input id='nat-api-key' type='password' autocomplete='off' value='" + escapeHtml(usingInjectedKey ? "" : state.savedApiKey) +
+            "' placeholder='" + (usingInjectedKey ? "Using TornPDA injected API key" : "Enter Torn API key") + "'><button data-action='save-key'>Save Key</button></div>" +
+            (usingInjectedKey ? "<p class='nat-key-source'>A TornPDA injected API key is active and is never shown or stored by this tracker.</p>" : "") +
+            "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:00 UTC</strong><p>Automatic refresh pauses while the tab is inactive and resumes safely when it returns.</p></div>" +
             "<div class='nat-setting-note nat-runtime-note'><span>Runtime</span><strong data-runtime-label>" + runtimeLabel() + "</strong><p data-runtime-detail>" + runtimeDescription() + "</p></div>" +
-            "<button class='nat-theme-button' data-action='toggle-theme'>Use " + (state.theme === "dark" ? "Light" : "Dark") + " Mode</button></section>";
+            "<div class='nat-setting-note'><span>Screen Size</span><strong data-screen-size>" + screenSizeLabel() + "</strong><p>Live visual viewport.</p></div>" +
+            "<div class='nat-setting-note'><span>Storage Method</span><strong data-storage-method>" + storageMethodLabel() + "</strong><p data-storage-detail>" + storageMethodDescription() + "</p></div>" +
+            "<label class='nat-storage-toggle' for='nat-use-legacy-gm-storage'><input id='nat-use-legacy-gm-storage' type='checkbox' data-action='toggle-legacy-storage'" + legacyChecked + "><span><strong>Use legacy GM storage</strong><small>Moves current tracker data before switching the primary store.</small></span></label>" +
+            "<div class='nat-setting-note nat-backup-note'><span>Backup &amp; Restore</span><strong>Local tracker data</strong><p>Downloads your cache, layout, and preferences. TornPDA injected keys are never included.</p></div>" +
+            "<label class='nat-storage-toggle' for='nat-backup-include-key'><input id='nat-backup-include-key' type='checkbox' data-action='toggle-backup-api-key'" + backupKeyChecked + "><span><strong>Include saved manual API key</strong><small>Unchecked by default. Include it only in a backup you can keep secure.</small></span></label>" +
+            "<input id='nat-backup-file' type='file' accept='application/json,.json' hidden><div class='nat-settings-actions nat-backup-actions'><button data-action='download-backup'>Download Backup</button><button class='nat-ghost-button' data-action='choose-backup'>Restore Backup</button></div>" + backupConfirmation +
+            (state.error ? "<div class='nat-error'>" + escapeHtml(state.error) + "</div>" : "") +
+            "<div class='nat-settings-actions'><button data-action='native-reminder'>Remind Me at Next Refresh</button><button class='nat-theme-button' data-action='toggle-theme'>Use " + (state.theme === "dark" ? "Light" : "Dark") + " Mode</button></div></section>";
     }
-    function saveDashboardState() {
-        gmSet(STORAGE.dashboard, {
+    function dashboardStateValue() {
+        return {
             activeTab: state.activeTab, theme: state.theme, isMinimized: state.isMinimized,
             windowSizes: state.windowSizes, searchQueries: state.searchQueries, collectionViews: state.collectionViews
+        };
+    }
+    function saveDashboardState() {
+        gmSet(STORAGE.dashboard, dashboardStateValue());
+    }
+    function currentStorageValues() {
+        return {
+            [STORAGE.key]: state.savedApiKey ? state.savedApiKey : STORAGE_DELETE,
+            [STORAGE.dashboard]: dashboardStateValue(),
+            [STORAGE.position]: state.position,
+            [STORAGE.cache]: state.cache,
+            [STORAGE.refreshedAt]: state.refreshedAt
+        };
+    }
+    function isBackupRecord(value) {
+        return Boolean(value) && Object.prototype.toString.call(value) === "[object Object]";
+    }
+    function hasExactBackupKeys(value, expected) {
+        if (!isBackupRecord(value)) return false;
+        const actual = Object.keys(value).sort();
+        const keys = [...expected].sort();
+        return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+    }
+    function isSafeBackupJson(value, depth = 0, budget = { count: 0 }) {
+        if (++budget.count > 50000 || depth > 40) return false;
+        if (value === null || typeof value === "boolean") return true;
+        if (typeof value === "number") return Number.isFinite(value);
+        if (typeof value === "string") return value.length <= 200000;
+        if (Array.isArray(value)) return value.every((item) => isSafeBackupJson(item, depth + 1, budget));
+        if (!isBackupRecord(value)) return false;
+        const keys = Object.keys(value);
+        if (keys.length > 10000 || keys.some((key) => ["__proto__", "prototype", "constructor"].includes(key))) return false;
+        return keys.every((key) => isSafeBackupJson(value[key], depth + 1, budget));
+    }
+    function validateBackupDashboard(value) {
+        if (!hasExactBackupKeys(value, ["activeTab", "theme", "isMinimized", "windowSizes", "searchQueries", "collectionViews"])) return false;
+        if (!["awards", "honors", "medals", "settings"].includes(value.activeTab) || !["dark", "light"].includes(value.theme) || typeof value.isMinimized !== "boolean") return false;
+        if (!isBackupRecord(value.windowSizes) || !isBackupRecord(value.searchQueries) || !isBackupRecord(value.collectionViews)) return false;
+        if (!Object.keys(value.windowSizes).every((key) => ["awards", "settings"].includes(key) && hasExactBackupKeys(value.windowSizes[key], ["width", "height"]) &&
+            [value.windowSizes[key].width, value.windowSizes[key].height].every((number) => Number.isFinite(number) && number > 0 && number <= 20000))) return false;
+        if (!hasExactBackupKeys(value.searchQueries, ["honors", "medals"]) || !Object.values(value.searchQueries).every((query) => typeof query === "string" && query.length <= 500)) return false;
+        return hasExactBackupKeys(value.collectionViews, ["honors", "medals"]) && Object.values(value.collectionViews).every((view) => ["completed", "incomplete"].includes(view));
+    }
+    function validateBackupPosition(value) {
+        return value === null || (hasExactBackupKeys(value, ["edge", "x", "y"]) && ["left", "right", "top", "bottom"].includes(value.edge) &&
+            [value.x, value.y].every((number) => Number.isFinite(number) && Math.abs(number) <= 1000000));
+    }
+    function validateBackupPayload(payload) {
+        if (!hasExactBackupKeys(payload, ["namespace", "schemaVersion", "createdAt", "data"]) || payload.namespace !== BACKUP_NAMESPACE || payload.schemaVersion !== BACKUP_SCHEMA_VERSION ||
+            !Number.isSafeInteger(payload.createdAt) || payload.createdAt <= 0 || !isBackupRecord(payload.data)) throw new Error("Invalid backup");
+        const data = payload.data;
+        const expectedKeys = ["dashboard", "position", "cache", "refreshedAt", "useLegacyGMStorage", "includesApiKey"];
+        if (!hasExactBackupKeys(data, data.includesApiKey === true ? [...expectedKeys, "apiKey"] : expectedKeys)) throw new Error("Invalid backup");
+        if (typeof data.includesApiKey !== "boolean" || (data.includesApiKey && (typeof data.apiKey !== "string" || data.apiKey.length > 256))) throw new Error("Invalid backup");
+        if (!validateBackupDashboard(data.dashboard) || !validateBackupPosition(data.position) || !Number.isSafeInteger(data.refreshedAt) || data.refreshedAt < 0 || typeof data.useLegacyGMStorage !== "boolean") throw new Error("Invalid backup");
+        if (data.cache !== null && (!hasExactBackupKeys(data.cache, ["medals", "honors", "progress"]) || !isSafeBackupJson(data.cache))) throw new Error("Invalid backup");
+        return payload;
+    }
+    function createBackupPayload(includeApiKey = false) {
+        const includesApiKey = Boolean(includeApiKey && state.savedApiKey);
+        const data = {
+            dashboard: dashboardStateValue(), position: state.position, cache: state.cache,
+            refreshedAt: Math.max(0, Math.round(Number(state.refreshedAt) || 0)),
+            useLegacyGMStorage: Boolean(state.useLegacyGMStorage), includesApiKey
+        };
+        if (includesApiKey) data.apiKey = state.savedApiKey;
+        return {
+            namespace: BACKUP_NAMESPACE, schemaVersion: BACKUP_SCHEMA_VERSION,
+            createdAt: Date.now(), data
+        };
+    }
+    function serializeBackupPayload(payload) {
+        return JSON.stringify(validateBackupPayload(payload), null, 2);
+    }
+    function parseBackupPayload(text) {
+        if (typeof text !== "string" || !text.length || text.length > BACKUP_MAX_BYTES) throw new Error("Invalid backup");
+        try {
+            return validateBackupPayload(JSON.parse(text));
+        } catch {
+            throw new Error("Invalid backup");
+        }
+    }
+    function backupFilename() {
+        const date = new Date();
+        const stamp = [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("");
+        return "naughty-awards-backup-v" + BACKUP_SCHEMA_VERSION + "-" + stamp + ".json";
+    }
+    function downloadBackupPayload(payload) {
+        const serialized = serializeBackupPayload(payload);
+        const blob = new Blob([serialized], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = backupFilename();
+        anchor.hidden = true;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+    async function readBackupFile(file) {
+        if (!file || !Number.isFinite(file.size) || file.size < 1 || file.size > BACKUP_MAX_BYTES) throw new Error("Invalid backup");
+        if (typeof file.text === "function") return file.text();
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error("Invalid backup"));
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.readAsText(file);
         });
+    }
+    async function prepareBackupRestore(file) {
+        const payload = parseBackupPayload(await readBackupFile(file));
+        state.pendingBackup = { payload, filename: String(file.name || "backup.json").replace(/[\\/]/g, "_").slice(0, 128) };
+        state.error = "";
+        showToast("Backup verified. Confirm to restore.", "blue");
+        return payload;
+    }
+    async function applyBackupPayload(payload) {
+        const backup = validateBackupPayload(payload);
+        const restoredSavedApiKey = backup.data.includesApiKey ? backup.data.apiKey : state.savedApiKey;
+        const values = {
+            [STORAGE.key]: restoredSavedApiKey ? restoredSavedApiKey : STORAGE_DELETE,
+            [STORAGE.dashboard]: backup.data.dashboard,
+            [STORAGE.position]: backup.data.position,
+            [STORAGE.cache]: backup.data.cache,
+            [STORAGE.refreshedAt]: backup.data.refreshedAt
+        };
+        const targetLegacy = backup.data.useLegacyGMStorage;
+        if (!(await STORAGE_ADAPTER.writeImmediately(values, { legacyPrimary: targetLegacy }))) throw new Error("Backup write failed");
+        const preference = await STORAGE_ADAPTER.writeEverywhere({ [STORAGE.useLegacyGMStorage]: targetLegacy });
+        if (!preference.legacy) throw new Error("Backup preference failed");
+        state.savedApiKey = restoredSavedApiKey;
+        state.apiKey = restoredSavedApiKey;
+        state.apiKeySource = "saved";
+        adoptInjectedPdaApiKey();
+        state.activeTab = backup.data.dashboard.activeTab;
+        state.theme = backup.data.dashboard.theme;
+        state.isMinimized = backup.data.dashboard.isMinimized;
+        state.windowSizes = backup.data.dashboard.windowSizes;
+        state.searchQueries = backup.data.dashboard.searchQueries;
+        state.collectionViews = backup.data.dashboard.collectionViews;
+        state.position = backup.data.position;
+        state.cache = backup.data.cache;
+        state.refreshedAt = backup.data.refreshedAt;
+        state.useLegacyGMStorage = targetLegacy;
+        state.pendingBackup = null;
+        state.error = "";
+        if (state.dashboard) {
+            applyWidgetView();
+            render();
+        }
+        showToast("Backup restored.", "green");
+        return true;
+    }
+    async function setUseLegacyGMStorage(enabled) {
+        const useLegacy = Boolean(enabled);
+        if (useLegacy === state.useLegacyGMStorage) return true;
+        const values = currentStorageValues();
+        const migrated = await STORAGE_ADAPTER.writeImmediately(values, { legacyPrimary: useLegacy });
+        if (!migrated) {
+            state.error = "Could not move all tracker data to " + (useLegacy ? "legacy GM storage" : "TornPDA PDA_storage") + "; the storage method was not changed.";
+            return false;
+        }
+        const preference = await STORAGE_ADAPTER.writeEverywhere({ [STORAGE.useLegacyGMStorage]: useLegacy });
+        if (!preference.legacy) {
+            state.error = "Could not persist the storage preference; the storage method was not changed.";
+            return false;
+        }
+        state.useLegacyGMStorage = useLegacy;
+        state.error = "";
+        logInfo("Storage method changed", { method: storageMethodLabel() });
+        showToast(useLegacy ? "Legacy GM storage is now primary." : "Preferred TornPDA storage is now primary.", "green");
+        return true;
     }
     function sizeKey() {
         return state.activeTab === "settings" ? "settings" : "awards";
@@ -715,7 +1341,7 @@
         ).join("");
         content.innerHTML = state.activeTab === "settings" ? settingsView() :
             "<div class='nat-refresh'><div class='nat-sync-status'><span class='nat-sync-dot " + (state.refreshInFlight ? "is-refreshing" : "") + "'></span><span>Updated <strong>" + (state.refreshedAt ? formatRelative(state.refreshedAt) : "Never") +
-            "</strong></span><small>Daily at 00:00 UTC</small></div><div class='nat-top-actions'><button class='nat-refresh-button' data-action='refresh' " + (state.refreshInFlight || !state.apiKey ? "disabled" : "") +
+            "</strong></span><small>" + (state.refreshPaused ? "Refresh paused while inactive" : "Daily at 00:00 UTC") + "</small></div><div class='nat-top-actions'><button class='nat-refresh-button' data-action='refresh' " + (state.refreshInFlight || !state.apiKey ? "disabled" : "") +
             ">↻ " + (state.refreshInFlight ? "Refreshing…" : "Refresh") + "</button><button class='nat-icon-button' data-tab='settings' title='Settings' aria-label='Settings'>⚙</button></div></div><nav class='nat-tabs' aria-label='Awards views'>" + tabs + "</nav>" +
             (state.error ? "<div class='nat-error'>" + escapeHtml(state.error) + "</div>" : "") + awardsView();
         dashboard.querySelectorAll("[data-tab]").forEach((button) => button.onclick = () => {
@@ -733,11 +1359,85 @@
         }));
         content.querySelector("[data-action='refresh']")?.addEventListener("click", () => void refreshAwards());
         content.querySelector("[data-action='save-key']")?.addEventListener("click", () => {
-            state.apiKey = content.querySelector("#nat-api-key").value.trim();
+            const saved = content.querySelector("#nat-api-key").value.trim();
+            if (state.apiKeySource === "tornpda" && !saved) {
+                showToast("TornPDA injected API key remains active.", "blue");
+                return;
+            }
+            state.savedApiKey = saved;
+            if (!adoptInjectedPdaApiKey()) {
+                state.apiKey = state.savedApiKey;
+                state.apiKeySource = "saved";
+            }
             state.error = "";
-            gmSet(STORAGE.key, state.apiKey);
+            if (state.savedApiKey) gmSet(STORAGE.key, state.savedApiKey);
+            else gmDelete(STORAGE.key);
             if (state.apiKey && !state.cache) void refreshAwards();
+            showToast(state.apiKeySource === "tornpda" ? "TornPDA injected API key is active." : (state.apiKey ? "API key saved." : "API key cleared."), "green");
             render();
+        });
+        content.querySelector("[data-action='toggle-legacy-storage']")?.addEventListener("change", async (event) => {
+            const checkbox = event.currentTarget;
+            checkbox.disabled = true;
+            const changed = await setUseLegacyGMStorage(checkbox.checked);
+            if (!changed) checkbox.checked = state.useLegacyGMStorage;
+            render();
+        });
+        content.querySelector("[data-action='toggle-backup-api-key']")?.addEventListener("change", (event) => {
+            state.backupIncludeApiKey = Boolean(event.currentTarget.checked);
+        });
+        content.querySelector("[data-action='download-backup']")?.addEventListener("click", () => {
+            try {
+                downloadBackupPayload(createBackupPayload(state.backupIncludeApiKey));
+                state.error = "";
+                showToast("Backup downloaded.", "green");
+            } catch {
+                state.error = "Backup could not be created.";
+                showToast("Backup could not be created.", "red");
+                render();
+            }
+        });
+        content.querySelector("[data-action='choose-backup']")?.addEventListener("click", () => content.querySelector("#nat-backup-file")?.click());
+        content.querySelector("#nat-backup-file")?.addEventListener("change", async (event) => {
+            const file = event.currentTarget.files?.[0];
+            if (!file) return;
+            try {
+                await prepareBackupRestore(file);
+            } catch {
+                state.pendingBackup = null;
+                state.error = "That file is not a valid Naughty Awards Tracker backup.";
+                showToast("Backup validation failed.", "red");
+            }
+            render();
+        });
+        content.querySelector("[data-action='cancel-backup-restore']")?.addEventListener("click", () => {
+            if (state.restoreInFlight) return;
+            state.pendingBackup = null;
+            state.error = "";
+            render();
+        });
+        content.querySelector("[data-action='confirm-backup-restore']")?.addEventListener("click", async () => {
+            if (!state.pendingBackup || state.restoreInFlight) return;
+            state.restoreInFlight = true;
+            render();
+            try {
+                await applyBackupPayload(state.pendingBackup.payload);
+            } catch {
+                state.error = "Backup could not be restored. Your current data has not been reloaded; retry after checking the selected storage method.";
+                showToast("Backup restore failed.", "red");
+            } finally {
+                state.restoreInFlight = false;
+                if (state.dashboard) render();
+            }
+        });
+        content.querySelector("[data-action='native-reminder']")?.addEventListener("click", async () => {
+            try {
+                const reminder = await scheduleRefreshReminder();
+                showToast(reminder.native ? "Native refresh reminder scheduled." : "Reminder is scheduled while this desktop tab remains open.", "green");
+            } catch (error) {
+                logDebug("Native reminder unavailable", { category: nativeErrorCategory(error) });
+                showToast("Native reminders are unavailable in this runtime.", "blue");
+            }
         });
         content.querySelector("[data-action='toggle-theme']")?.addEventListener("click", () => {
             state.theme = state.theme === "dark" ? "light" : "dark";
@@ -757,14 +1457,29 @@
         }));
         fitContent();
     }
-    function scheduleDailyRefresh() {
+    function armDailyRefresh(dueAt) {
         clearTimeout(state.dailyTimer);
-        const now = new Date();
-        const next = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
-        state.dailyTimer = setTimeout(async () => {
-            if (!state.isMinimized) await refreshAwards();
+        state.dailyTimer = null;
+        state.dailyRefreshDueAt = Number(dueAt) || nextDailyRefreshAt();
+        if (!isTrackerActive()) {
+            state.refreshPaused = true;
+            return;
+        }
+        state.refreshPaused = false;
+        state.dailyTimer = window.setTimeout(async () => {
+            state.dailyTimer = null;
+            if (!isTrackerActive()) {
+                state.autoRefreshQueued = true;
+                state.refreshPaused = true;
+                return;
+            }
+            state.autoRefreshQueued = false;
+            await refreshAwards({ automatic: true });
             scheduleDailyRefresh();
-        }, Math.max(1000, next - Date.now() + 250));
+        }, Math.max(1000, state.dailyRefreshDueAt - Date.now()));
+    }
+    function scheduleDailyRefresh() {
+        armDailyRefresh(nextDailyRefreshAt());
     }
     function bindWindowControls() {
         const dashboard = state.dashboard;
@@ -848,7 +1563,7 @@
             saveSize();
             savePosition();
             const status = dashboard.querySelector("#nat-resize-status");
-            if (status) status.textContent = "Window size " + Math.round(width) + " by " + Math.round(height) + " pixels.";
+            if (status) status.textContent = "Window size " + formatInteger(width) + " by " + formatInteger(height) + " pixels.";
         }));
         document.addEventListener("pointermove", (event) => {
             if (!resizing || !start || event.pointerId !== resizePointerId) return;
@@ -921,8 +1636,9 @@
             ".nat-collection-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:0 0 10px;padding:4px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-collection-tab{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0;background:transparent!important;border-color:transparent!important;color:#aebed3!important}.nat-collection-tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nat-collection-tab b{display:grid;place-items:center;min-width:22px;padding:2px 5px;border-radius:999px;color:#c9d9ef;background:rgba(118,151,193,.2);font-size:9px}.nat-collection-tab.active{background:#365d99!important;border-color:#5279b3!important;color:#fff!important;box-shadow:0 3px 8px rgba(6,12,22,.28)}.nat-collection-tab.active b{color:#fff;background:rgba(255,255,255,.18)}.nat-award-meta{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;color:#8fa7c3;font-size:9px;font-weight:750}.nat-award-meta span{padding:2px 5px;border:1px solid #38506e;border-radius:999px;background:rgba(9,16,26,.26)}.nat-award-rarity{color:inherit}.nat-award-status{align-self:start;margin-top:1px;padding:3px 5px;border:1px solid #5c6680;border-radius:5px;color:#b8c7dc;background:rgba(94,111,140,.16);font-size:9px;font-weight:800;line-height:1.2;white-space:nowrap}#nat-wrapper[data-theme='light'] .nat-collection-switch{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-collection-tab{color:#3c526b!important}#nat-wrapper[data-theme='light'] .nat-collection-tab.active{background:#365f99!important;border-color:#2b568f!important;color:#fff!important}#nat-wrapper[data-theme='light'] .nat-award-meta{color:#526981}#nat-wrapper[data-theme='light'] .nat-award-meta span{border-color:#a9bacb;background:#dce5ee}#nat-wrapper[data-theme='light'] .nat-award-status{border-color:#a0afbf;color:#3f536b;background:#d7e0e9}@container (max-width:380px){.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 5px!important;font-size:10px!important}.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}}" +
             "</style><style>" +
             "#nat-wrapper{box-sizing:border-box;max-inline-size:var(--nat-panel-max-width,calc(100vw - 20px));max-block-size:var(--nat-panel-max-height,calc(100dvh - 20px))}#nat-wrapper[data-runtime='tornpda'][data-edge]{margin:0}#nat-safe-area-probe{display:block;position:fixed;inset:0 auto auto 0;visibility:hidden;pointer-events:none;inline-size:0;block-size:0;min-inline-size:0!important;min-block-size:0!important;margin:0;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);border:0}#nat-drag{min-width:0}#nat-title{flex:1 1 auto;min-width:0}#nat-body{overflow-x:clip;overflow-y:auto}#nat-content,.nat-grid,.nat-list,.nat-card,.nat-summary-card,.nat-search-panel,.nat-refresh,.nat-tabs,.nat-card-header,.nat-progress-header,.nat-award-row,.nat-progress-row,.nat-key-row,.nat-collection-switch{min-width:0;max-width:100%}.nat-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%}.nat-tab{width:100%;min-width:0}.nat-card-header>div,.nat-progress-header>div,.nat-total,.nat-card-note,.nat-progress-percent,.nat-award-row time,.nat-award-status{min-width:0;max-width:100%}.nat-progress-value{min-width:0}" +
-            "@container (max-width:430px){.nat-refresh{flex-wrap:wrap;gap:7px}.nat-sync-status{flex:1 1 100%}.nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}.nat-refresh-button{width:100%}.nat-search-panel{grid-template-columns:minmax(0,1fr)}.nat-search-count{justify-self:start}.nat-key-row{flex-direction:column}.nat-key-row button,.nat-theme-button{width:100%}.nat-card-header,.nat-progress-header{flex-wrap:wrap;gap:6px}.nat-total{justify-items:start}.nat-card-note{justify-self:start}.nat-award-row{grid-template-columns:4px minmax(0,1fr);gap:7px}.nat-award-row time,.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}.nat-progress-value{flex-wrap:wrap}.nat-tabs{gap:3px;padding:3px}.nat-tab{padding:7px 4px!important;font-size:10px!important}}@container (max-width:300px){#nat-body{padding:6px}.nat-card{padding:8px}.nat-tabs{gap:2px;padding:2px}.nat-tab{padding:6px 2px!important;font-size:9px!important}.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 4px!important;font-size:9px!important}.nat-search-panel{padding:6px}.nat-search-field{padding:0 5px}}" +
-            "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body' tabindex='0' aria-label='Awards Tracker content'><div id='nat-content'></div></main><i id='nat-safe-area-probe' aria-hidden='true'></i><span id='nat-resize-status' class='nat-sr-only' aria-live='polite'></span><button type='button' class='nat-resize' data-corner='top-left' title='Resize from the upper-left corner' aria-label='Resize window from the upper-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-left' title='Resize from the bottom-left corner' aria-label='Resize window from the bottom-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-right' title='Resize from the bottom-right corner' aria-label='Resize window from the bottom-right corner. Use arrow keys; hold Shift for larger changes.'></button>";
+            ".nat-storage-toggle{display:flex;align-items:flex-start;gap:9px;padding:9px;border:1px solid #3c5271;border-radius:8px;background:rgba(7,13,22,.28);cursor:pointer}.nat-storage-toggle input{flex:0 0 auto;width:18px;height:18px;margin:1px 0 0;accent-color:#4c78ad}.nat-storage-toggle span{display:grid;gap:3px;min-width:0}.nat-storage-toggle strong{color:#edf4ff;font-size:11px}.nat-storage-toggle small{color:#9baabd;font-size:10px;line-height:1.35}#nat-wrapper[data-theme='light'] .nat-storage-toggle{border-color:#a7b8c9;background:#d5dfe9}#nat-wrapper[data-theme='light'] .nat-storage-toggle strong{color:#142238}#nat-wrapper[data-theme='light'] .nat-storage-toggle small{color:#4c6076}.nat-settings-actions{display:flex;flex-wrap:wrap;gap:7px}.nat-backup-confirm{display:grid;gap:7px;padding:9px;border:1px solid #5279b3;border-radius:8px;background:rgba(30,55,88,.35)}.nat-backup-confirm strong,.nat-backup-confirm p{min-width:0;overflow-wrap:anywhere}.nat-backup-confirm p{margin:0;color:#b9c9dd;font-size:10px;line-height:1.4}#nat-wrapper[data-theme='light'] .nat-backup-confirm{border-color:#879fbd;background:#d5e1ed}#nat-wrapper[data-theme='light'] .nat-backup-confirm p{color:#40556c}.nat-key-source{margin:0;color:#9dd8ff!important;font-size:10px;line-height:1.4}#nat-toast{position:absolute;z-index:8;right:10px;bottom:10px;max-width:calc(100% - 20px);padding:9px 11px;border:1px solid #4a668d;border-radius:8px;background:rgba(20,41,68,.97);color:#f7fbff;font-size:11px;font-weight:700;box-shadow:0 8px 20px rgba(0,0,0,.34)}#nat-toast[data-tone='green']{border-color:#3d8b64;background:rgba(25,85,61,.97)}#nat-toast[data-tone='red']{border-color:#a34b55;background:rgba(120,42,50,.97)}#nat-toast[hidden]{display:none}#nat-wrapper[data-theme='light'] .nat-key-source{color:#365f99!important}#nat-wrapper[data-theme='light'] #nat-toast{border-color:#8097b4;background:#e6eef7;color:#142238}" +
+            "@container (max-width:430px){.nat-refresh{flex-wrap:wrap;gap:7px}.nat-sync-status{flex:1 1 100%}.nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}.nat-refresh-button{width:100%}.nat-search-panel{grid-template-columns:minmax(0,1fr)}.nat-search-count{justify-self:start}.nat-key-row{flex-direction:column}.nat-key-row button,.nat-theme-button{width:100%}.nat-settings-actions{display:grid;grid-template-columns:minmax(0,1fr);width:100%}.nat-settings-actions button{width:100%}.nat-card-header,.nat-progress-header{flex-wrap:wrap;gap:6px}.nat-total{justify-items:start}.nat-card-note{justify-self:start}.nat-award-row{grid-template-columns:4px minmax(0,1fr);gap:7px}.nat-award-row time,.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}.nat-progress-value{flex-wrap:wrap}.nat-tabs{gap:3px;padding:3px}.nat-tab{padding:7px 4px!important;font-size:10px!important}}@container (max-width:300px){#nat-body{padding:6px}.nat-card{padding:8px}.nat-tabs{gap:2px;padding:2px}.nat-tab{padding:6px 2px!important;font-size:9px!important}.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 4px!important;font-size:9px!important}.nat-search-panel{padding:6px}.nat-search-field{padding:0 5px}}" +
+            "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body' tabindex='0' aria-label='Awards Tracker content'><div id='nat-content'></div></main><i id='nat-safe-area-probe' aria-hidden='true'></i><span id='nat-toast' role='status' aria-live='polite' hidden></span><span id='nat-resize-status' class='nat-sr-only' aria-live='polite'></span><button type='button' class='nat-resize' data-corner='top-left' title='Resize from the upper-left corner' aria-label='Resize window from the upper-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-left' title='Resize from the bottom-left corner' aria-label='Resize window from the bottom-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-right' title='Resize from the bottom-right corner' aria-label='Resize window from the bottom-right corner. Use arrow keys; hold Shift for larger changes.'></button>";
         document.body.appendChild(dashboard);
         state.dashboard = dashboard;
         updateRuntimeLayout();
@@ -932,11 +1648,15 @@
     }
     async function bootstrap() {
         await loadPdaStorage();
+        await loadStoragePreference();
         const [apiKey, dashboard, position, cache, refreshedAt] = await Promise.all([
             gmGet(STORAGE.key, ""), gmGet(STORAGE.dashboard, {}), gmGet(STORAGE.position, null),
             gmGet(STORAGE.cache, null), gmGet(STORAGE.refreshedAt, 0)
         ]);
-        state.apiKey = String(apiKey || "").trim();
+        state.savedApiKey = String(apiKey || "").trim();
+        state.apiKey = state.savedApiKey;
+        state.apiKeySource = "saved";
+        adoptInjectedPdaApiKey();
         state.activeTab = ["awards", "honors", "medals", "settings"].includes(dashboard?.activeTab) ? dashboard.activeTab : "awards";
         state.theme = dashboard?.theme === "light" ? "light" : "dark";
         state.isMinimized = dashboard?.isMinimized === true;
@@ -954,6 +1674,7 @@
         state.refreshedAt = Number(refreshedAt || 0);
         logInfo("Bootstrap completed", { version: VERSION, hasApiKey: Boolean(state.apiKey), cached: Boolean(state.cache), runtime: runtimeLabel() });
         initializeDashboard();
+        bindActivityLifecycle();
         scheduleDailyRefresh();
     }
     detectRuntimeAtStartup();
