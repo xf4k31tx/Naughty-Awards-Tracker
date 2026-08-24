@@ -44,7 +44,7 @@ Use the settings button to save or replace the Torn API key, switch theme, inspe
 
 ## Desktop and TornPDA
 
-The desktop widget is movable, resizable, and minimizable. TornPDA is detected through its native bridge; the mobile layout follows the live viewport, safe areas, and orientation. Small screens reflow award rows and controls instead of relying on cramped desktop dimensions.
+The desktop widget is movable, resizable, and minimizable. TornPDA is detected through its native bridge; the mobile layout follows the live viewport, safe areas, and orientation. Small screens reflow award rows and controls instead of relying on cramped desktop dimensions. Its metadata declares both legacy and modern userscript storage/network grants for TornPDA and Tampermonkey compatibility.
 
 ## Data and privacy
 

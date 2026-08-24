@@ -6,6 +6,9 @@
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
 // @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @connect      api.torn.com
@@ -140,14 +143,24 @@
     const getNestedNumber = (value, path) => Number(path.reduce((current, key) => current && current[key], value) || 0);
 
     async function gmGet(key, fallback) {
-        try { return await GM.getValue(key, fallback); } catch { return fallback; }
+        try {
+            if (typeof GM !== "undefined" && typeof GM.getValue === "function") return await GM.getValue(key, fallback);
+            if (typeof GM_getValue === "function") return await Promise.resolve(GM_getValue(key, fallback));
+        } catch {}
+        return fallback;
     }
     function gmSet(key, value) {
-        void GM.setValue(key, value).catch(() => {});
+        try {
+            if (typeof GM !== "undefined" && typeof GM.setValue === "function") {
+                void Promise.resolve(GM.setValue(key, value)).catch(() => {});
+                return;
+            }
+            if (typeof GM_setValue === "function") GM_setValue(key, value);
+        } catch {}
     }
     function requestJson(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            const request = {
                 method: "GET", url, headers: { Accept: "application/json" },
                 onload: (response) => {
                     if (response.status < 200 || response.status >= 300) {
@@ -161,7 +174,10 @@
                     } catch { reject(new Error("Unable to parse API response")); }
                 },
                 onerror: () => reject(new Error("Network request failed"))
-            });
+            };
+            if (typeof GM_xmlhttpRequest === "function") GM_xmlhttpRequest(request);
+            else if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") GM.xmlHttpRequest(request);
+            else reject(new Error("Userscript network permission is unavailable."));
         });
     }
     function apiUrl(path, params = {}) {
