@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.3.4
+// @version      1.3.5
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
@@ -17,7 +17,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.4";
+    const VERSION = "1.3.5";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
@@ -142,11 +142,14 @@
         const dashboard = state.dashboard;
         if (!dashboard) return;
         const viewport = getViewportMetrics();
+        const bounds = getPanelBounds();
         dashboard.dataset.runtime = state.runtime.isTornPDA ? "tornpda" : "desktop";
         dashboard.dataset.orientation = viewport.orientation;
-        dashboard.dataset.compact = state.runtime.isTornPDA && (viewport.width < 480 || viewport.height < 520) ? "true" : "false";
+        dashboard.dataset.compact = state.runtime.isTornPDA && (bounds.width < 480 || bounds.height < 520) ? "true" : "false";
         dashboard.style.setProperty("--nat-viewport-width", viewport.width + "px");
         dashboard.style.setProperty("--nat-viewport-height", viewport.height + "px");
+        dashboard.style.setProperty("--nat-panel-max-width", Math.max(1, Math.floor(bounds.width)) + "px");
+        dashboard.style.setProperty("--nat-panel-max-height", Math.max(1, Math.floor(bounds.height)) + "px");
         const label = dashboard.querySelector("[data-runtime-label]");
         const detail = dashboard.querySelector("[data-runtime-detail]");
         if (label) label.textContent = runtimeLabel();
@@ -169,7 +172,7 @@
         } finally {
             state.runtime.confirmed = true;
             updateRuntimeLayout();
-            if (!state.isMinimized && state.dashboard) applySize();
+            if (state.dashboard) state.isMinimized ? applyPosition() : applySize();
             logInfo("Runtime confirmed", {
                 runtime: state.runtime.isTornPDA ? "TornPDA" : "desktop",
                 bridge: isTornPdaBridgeAvailable(),
@@ -204,6 +207,59 @@
         return Math.floor(elapsed / 86400000) + "d ago";
     };
     const clamp = (number, min, max) => Math.min(Math.max(number, min), Math.max(min, max));
+    function panelBounds(viewport, safeArea = {}, gutter = 0) {
+        const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+        const width = Math.max(1, finite(viewport?.width, 1));
+        const height = Math.max(1, finite(viewport?.height, 1));
+        const left = finite(viewport?.left);
+        const top = finite(viewport?.top);
+        const inset = (name) => Math.max(0, finite(safeArea?.[name])) + Math.max(0, finite(gutter));
+        const constrain = (start, end, span) => {
+            const requested = start + end;
+            const availableInset = Math.max(0, span - 1);
+            const scale = requested > availableInset && requested > 0 ? availableInset / requested : 1;
+            return { start: start * scale, end: end * scale };
+        };
+        const horizontal = constrain(inset("left"), inset("right"), width);
+        const vertical = constrain(inset("top"), inset("bottom"), height);
+        const bounds = {
+            left: left + horizontal.start,
+            top: top + vertical.start,
+            right: left + width - horizontal.end,
+            bottom: top + height - vertical.end
+        };
+        bounds.width = Math.max(1, bounds.right - bounds.left);
+        bounds.height = Math.max(1, bounds.bottom - bounds.top);
+        return bounds;
+    }
+    function getSafeAreaInsets() {
+        const probe = state.dashboard?.querySelector("#nat-safe-area-probe");
+        if (!probe || typeof window.getComputedStyle !== "function") return { top: 0, right: 0, bottom: 0, left: 0 };
+        const style = window.getComputedStyle(probe);
+        const pixels = (property) => Math.max(0, Number.parseFloat(style.getPropertyValue(property)) || 0);
+        return {
+            top: pixels("padding-top"), right: pixels("padding-right"),
+            bottom: pixels("padding-bottom"), left: pixels("padding-left")
+        };
+    }
+    function getPanelBounds() {
+        const viewport = getViewportMetrics();
+        return panelBounds(viewport, state.runtime.isTornPDA ? getSafeAreaInsets() : {}, state.runtime.isTornPDA ? 6 : 10);
+    }
+    function clampPanelSize(size, fallback, limits) {
+        const number = (value, fallbackValue) => {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackValue;
+        };
+        const maxWidth = Math.max(1, Number(limits.maxWidth) || 1);
+        const maxHeight = Math.max(1, Number(limits.maxHeight) || 1);
+        const minWidth = Math.min(maxWidth, Math.max(1, Number(limits.minWidth) || 1));
+        const minHeight = Math.min(maxHeight, Math.max(1, Number(limits.minHeight) || 1));
+        return {
+            width: clamp(number(size?.width, fallback.width), minWidth, maxWidth),
+            height: clamp(number(size?.height, fallback.height), minHeight, maxHeight)
+        };
+    }
     const getNestedNumber = (value, path) => Number(path.reduce((current, key) => current && current[key], value) || 0);
 
     function hasPdaStorage() {
@@ -545,10 +601,9 @@
         return state.activeTab === "settings" ? "settings" : "awards";
     }
     function getSizeLimits() {
-        const viewport = getViewportMetrics();
-        const margin = state.runtime.isTornPDA ? 12 : 20;
-        const maxWidth = Math.max(1, viewport.width - margin);
-        const maxHeight = Math.max(1, viewport.height - margin);
+        const bounds = getPanelBounds();
+        const maxWidth = bounds.width;
+        const maxHeight = bounds.height;
         return {
             minWidth: Math.min(state.runtime.isTornPDA ? 300 : 380, maxWidth),
             minHeight: Math.min(state.runtime.isTornPDA ? 340 : 620, maxHeight),
@@ -557,40 +612,43 @@
     }
     function defaultSize(limits) {
         const viewport = getViewportMetrics();
+        const bounds = getPanelBounds();
         if (state.runtime.isTornPDA) {
             const topOffset = viewport.orientation === "portrait" ? 60 : 12;
             return {
                 width: limits.maxWidth,
-                height: clamp(viewport.height - topOffset - 12, limits.minHeight, limits.maxHeight)
+                height: clamp(bounds.height - topOffset, limits.minHeight, limits.maxHeight)
             };
         }
-        return { width: 480, height: Math.min(720, Math.round(viewport.height * .8)) };
+        return { width: 480, height: Math.min(720, Math.round(bounds.height * .8)) };
     }
     function applyPosition(position = state.position) {
         const dashboard = state.dashboard;
         if (!dashboard) return;
         const viewport = getViewportMetrics();
+        const bounds = getPanelBounds();
         const rect = dashboard.getBoundingClientRect();
-        const defaultTop = viewport.top + (state.runtime.isTornPDA && viewport.orientation === "portrait" ? 60 : 20);
-        const saved = position || { edge: "right", x: viewport.left + viewport.width - rect.width, y: defaultTop };
-        const maxX = Math.max(viewport.left, viewport.left + viewport.width - rect.width);
-        const maxY = Math.max(viewport.top, viewport.top + viewport.height - rect.height);
-        const x = clamp(Number(saved.x ?? viewport.left), viewport.left, maxX);
-        const y = clamp(Number(saved.y ?? viewport.top), viewport.top, maxY);
+        const defaultTop = bounds.top + (state.runtime.isTornPDA && viewport.orientation === "portrait" ? 60 : 20);
+        const saved = position || { edge: "right", x: bounds.right - rect.width, y: defaultTop };
+        const maxX = Math.max(bounds.left, bounds.right - rect.width);
+        const maxY = Math.max(bounds.top, bounds.bottom - rect.height);
+        const coordinate = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+        const x = clamp(coordinate(saved.x, bounds.left), bounds.left, maxX);
+        const y = clamp(coordinate(saved.y, bounds.top), bounds.top, maxY);
         dashboard.style.right = "auto";
         dashboard.style.bottom = "auto";
         dashboard.dataset.edge = saved.edge || "right";
-        if (saved.edge === "left") { dashboard.style.left = viewport.left + "px"; dashboard.style.top = y + "px"; }
-        else if (saved.edge === "top") { dashboard.style.left = x + "px"; dashboard.style.top = viewport.top + "px"; }
+        if (saved.edge === "left") { dashboard.style.left = bounds.left + "px"; dashboard.style.top = y + "px"; }
+        else if (saved.edge === "top") { dashboard.style.left = x + "px"; dashboard.style.top = bounds.top + "px"; }
         else if (saved.edge === "bottom") { dashboard.style.left = x + "px"; dashboard.style.top = maxY + "px"; }
         else { dashboard.style.left = maxX + "px"; dashboard.style.top = y + "px"; }
     }
     function savePosition() {
         const rect = state.dashboard.getBoundingClientRect();
-        const viewport = getViewportMetrics();
+        const bounds = getPanelBounds();
         const distances = {
-            left: rect.left - viewport.left, right: viewport.left + viewport.width - rect.right,
-            top: rect.top - viewport.top, bottom: viewport.top + viewport.height - rect.bottom
+            left: rect.left - bounds.left, right: bounds.right - rect.right,
+            top: rect.top - bounds.top, bottom: bounds.bottom - rect.bottom
         };
         const edge = Object.entries(distances).sort((a, b) => a[1] - b[1])[0][0];
         state.position = { edge, x: rect.left, y: rect.top };
@@ -600,7 +658,8 @@
     function saveSize() {
         if (state.isMinimized) return;
         const rect = state.dashboard.getBoundingClientRect();
-        state.windowSizes[sizeKey()] = { width: rect.width, height: rect.height };
+        const limits = getSizeLimits();
+        state.windowSizes[sizeKey()] = clampPanelSize(rect, defaultSize(limits), limits);
         saveDashboardState();
     }
     function applySize() {
@@ -608,9 +667,9 @@
         const dashboard = state.dashboard;
         const limits = getSizeLimits();
         const fallback = defaultSize(limits);
-        const saved = state.windowSizes[sizeKey()] || fallback;
-        dashboard.style.width = clamp(Number(saved.width || fallback.width), limits.minWidth, limits.maxWidth) + "px";
-        dashboard.style.height = clamp(Number(saved.height || fallback.height), limits.minHeight, limits.maxHeight) + "px";
+        const saved = clampPanelSize(state.windowSizes[sizeKey()], fallback, limits);
+        dashboard.style.width = saved.width + "px";
+        dashboard.style.height = saved.height + "px";
         applyPosition();
         fitContent();
     }
@@ -725,10 +784,10 @@
         });
         document.addEventListener("pointermove", (event) => {
             if (!dragging || event.pointerId !== dragPointerId) return;
-            const viewport = getViewportMetrics();
+            const bounds = getPanelBounds();
             const rect = dashboard.getBoundingClientRect();
-            const left = clamp(event.clientX - offsetX, viewport.left, Math.max(viewport.left, viewport.left + viewport.width - rect.width));
-            const top = clamp(event.clientY - offsetY, viewport.top, Math.max(viewport.top, viewport.top + viewport.height - rect.height));
+            const left = clamp(event.clientX - offsetX, bounds.left, Math.max(bounds.left, bounds.right - rect.width));
+            const top = clamp(event.clientY - offsetY, bounds.top, Math.max(bounds.top, bounds.bottom - rect.height));
             moved = moved || Math.abs(left - rect.left) > 2 || Math.abs(top - rect.top) > 2;
             dashboard.style.left = left + "px";
             dashboard.style.top = top + "px";
@@ -769,7 +828,7 @@
             if (state.isMinimized || !/^Arrow(?:Left|Right|Up|Down)$/.test(event.key)) return;
             event.preventDefault();
             const rect = dashboard.getBoundingClientRect();
-            const viewport = getViewportMetrics();
+            const bounds = getPanelBounds();
             const limits = getSizeLimits();
             const corner = handle.dataset.corner || "bottom-right";
             const fromLeft = corner.endsWith("left");
@@ -777,14 +836,14 @@
             const step = event.shiftKey ? 24 : 8;
             const dx = event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0;
             const dy = event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0;
-            const maxWidth = Math.min(limits.maxWidth, fromLeft ? rect.right - viewport.left : viewport.left + viewport.width - rect.left);
-            const maxHeight = Math.min(limits.maxHeight, fromTop ? rect.bottom - viewport.top : viewport.top + viewport.height - rect.top);
+            const maxWidth = Math.min(limits.maxWidth, fromLeft ? rect.right - bounds.left : bounds.right - rect.left);
+            const maxHeight = Math.min(limits.maxHeight, fromTop ? rect.bottom - bounds.top : bounds.bottom - rect.top);
             const width = clamp(rect.width + (fromLeft ? -dx : dx), limits.minWidth, Math.max(limits.minWidth, maxWidth));
             const height = clamp(rect.height + (fromTop ? -dy : dy), limits.minHeight, Math.max(limits.minHeight, maxHeight));
             dashboard.style.width = width + "px";
             dashboard.style.height = height + "px";
-            dashboard.style.left = (fromLeft ? rect.right - width : rect.left) + "px";
-            dashboard.style.top = (fromTop ? rect.bottom - height : rect.top) + "px";
+            dashboard.style.left = clamp(fromLeft ? rect.right - width : rect.left, bounds.left, Math.max(bounds.left, bounds.right - width)) + "px";
+            dashboard.style.top = clamp(fromTop ? rect.bottom - height : rect.top, bounds.top, Math.max(bounds.top, bounds.bottom - height)) + "px";
             fitContent();
             saveSize();
             savePosition();
@@ -794,17 +853,17 @@
         document.addEventListener("pointermove", (event) => {
             if (!resizing || !start || event.pointerId !== resizePointerId) return;
             const limits = getSizeLimits();
-            const viewport = getViewportMetrics();
+            const bounds = getPanelBounds();
             const fromLeft = start.corner.endsWith("left");
             const fromTop = start.corner.startsWith("top");
-            const maxWidth = Math.min(limits.maxWidth, fromLeft ? start.rect.right - viewport.left : viewport.left + viewport.width - start.rect.left);
-            const maxHeight = Math.min(limits.maxHeight, fromTop ? start.rect.bottom - viewport.top : viewport.top + viewport.height - start.rect.top);
+            const maxWidth = Math.min(limits.maxWidth, fromLeft ? start.rect.right - bounds.left : bounds.right - start.rect.left);
+            const maxHeight = Math.min(limits.maxHeight, fromTop ? start.rect.bottom - bounds.top : bounds.bottom - start.rect.top);
             const width = clamp(start.rect.width + (fromLeft ? start.x - event.clientX : event.clientX - start.x), limits.minWidth, Math.max(limits.minWidth, maxWidth));
             const height = clamp(start.rect.height + (fromTop ? start.y - event.clientY : event.clientY - start.y), limits.minHeight, Math.max(limits.minHeight, maxHeight));
             dashboard.style.width = width + "px";
             dashboard.style.height = height + "px";
-            dashboard.style.left = (fromLeft ? start.rect.right - width : start.rect.left) + "px";
-            dashboard.style.top = (fromTop ? start.rect.bottom - height : start.rect.top) + "px";
+            dashboard.style.left = clamp(fromLeft ? start.rect.right - width : start.rect.left, bounds.left, Math.max(bounds.left, bounds.right - width)) + "px";
+            dashboard.style.top = clamp(fromTop ? start.rect.bottom - height : start.rect.top, bounds.top, Math.max(bounds.top, bounds.bottom - height)) + "px";
             fitContent();
         });
         const finishResizing = (event) => {
@@ -822,12 +881,14 @@
             cancelAnimationFrame(viewportFrame);
             viewportFrame = requestAnimationFrame(() => {
                 updateRuntimeLayout();
-                if (!state.isMinimized) applySize();
+                if (state.isMinimized) applyPosition();
+                else applySize();
             });
         };
         window.addEventListener("resize", refreshViewportLayout);
         window.addEventListener("orientationchange", refreshViewportLayout);
         window.visualViewport?.addEventListener("resize", refreshViewportLayout);
+        window.visualViewport?.addEventListener("scroll", refreshViewportLayout);
     }
     function initializeDashboard() {
         const dashboard = document.createElement("aside");
@@ -858,7 +919,10 @@
             "#nat-wrapper[data-runtime='tornpda']{border-radius:14px;max-width:calc(100vw - 12px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));max-height:calc(100dvh - 12px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));box-shadow:0 10px 28px rgba(0,0,0,.48)}#nat-wrapper[data-runtime='tornpda'][data-edge='left']{margin-left:env(safe-area-inset-left, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='right']{margin-right:env(safe-area-inset-right, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='top']{margin-top:env(safe-area-inset-top, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='bottom']{margin-bottom:env(safe-area-inset-bottom, 0px)}#nat-wrapper[data-runtime='tornpda'] #nat-drag{min-height:52px;padding:10px 12px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] #nat-minimize{width:44px;height:40px;flex-basis:44px;font-size:23px}#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:10px;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch}#nat-wrapper[data-runtime='tornpda'] #nat-content{width:100%!important;transform:none!important}#nat-wrapper[data-runtime='tornpda'] button:not(.nat-search-clear){min-height:40px;padding:9px 11px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-icon-button{width:40px;min-height:40px;font-size:17px!important}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{min-height:48px;padding:4px;gap:5px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{min-height:38px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:12px}#nat-wrapper[data-runtime='tornpda'] .nat-list{max-height:none;overflow:visible}#nat-wrapper[data-runtime='tornpda'] .nat-resize{width:36px;min-width:36px!important;height:36px;min-height:36px!important;touch-action:none}#nat-wrapper[data-runtime='tornpda'] .nat-search-field input{min-height:40px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-search-clear{width:32px;min-width:32px!important;min-height:32px!important;font-size:21px!important}" +
             "@container (max-width:430px){#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:8px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh{flex-wrap:wrap;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-sync-status{flex:1 1 100%}#nat-wrapper[data-runtime='tornpda'] .nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh-button{width:100%}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{gap:3px;padding:3px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{padding:7px 5px!important;font-size:10px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:10px}#nat-wrapper[data-runtime='tornpda'] .nat-search-panel{grid-template-columns:minmax(0,1fr)}#nat-wrapper[data-runtime='tornpda'] .nat-search-count{justify-self:start}#nat-wrapper[data-runtime='tornpda'] .nat-card-header{gap:6px}#nat-wrapper[data-runtime='tornpda'] .nat-total strong{font-size:11px!important}}@media (max-height:560px){#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-drag{min-height:44px;padding:7px 10px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-minimize{width:40px;height:34px;flex-basis:40px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-body{padding:7px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] .nat-card{padding:9px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] button:not(.nat-search-clear){min-height:34px;padding:7px 9px;font-size:11px}}" +
             ".nat-collection-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:0 0 10px;padding:4px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-collection-tab{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0;background:transparent!important;border-color:transparent!important;color:#aebed3!important}.nat-collection-tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nat-collection-tab b{display:grid;place-items:center;min-width:22px;padding:2px 5px;border-radius:999px;color:#c9d9ef;background:rgba(118,151,193,.2);font-size:9px}.nat-collection-tab.active{background:#365d99!important;border-color:#5279b3!important;color:#fff!important;box-shadow:0 3px 8px rgba(6,12,22,.28)}.nat-collection-tab.active b{color:#fff;background:rgba(255,255,255,.18)}.nat-award-meta{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;color:#8fa7c3;font-size:9px;font-weight:750}.nat-award-meta span{padding:2px 5px;border:1px solid #38506e;border-radius:999px;background:rgba(9,16,26,.26)}.nat-award-rarity{color:inherit}.nat-award-status{align-self:start;margin-top:1px;padding:3px 5px;border:1px solid #5c6680;border-radius:5px;color:#b8c7dc;background:rgba(94,111,140,.16);font-size:9px;font-weight:800;line-height:1.2;white-space:nowrap}#nat-wrapper[data-theme='light'] .nat-collection-switch{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-collection-tab{color:#3c526b!important}#nat-wrapper[data-theme='light'] .nat-collection-tab.active{background:#365f99!important;border-color:#2b568f!important;color:#fff!important}#nat-wrapper[data-theme='light'] .nat-award-meta{color:#526981}#nat-wrapper[data-theme='light'] .nat-award-meta span{border-color:#a9bacb;background:#dce5ee}#nat-wrapper[data-theme='light'] .nat-award-status{border-color:#a0afbf;color:#3f536b;background:#d7e0e9}@container (max-width:380px){.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 5px!important;font-size:10px!important}.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}}" +
-            "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body' tabindex='0' aria-label='Awards Tracker content'><div id='nat-content'></div></main><span id='nat-resize-status' class='nat-sr-only' aria-live='polite'></span><button type='button' class='nat-resize' data-corner='top-left' title='Resize from the upper-left corner' aria-label='Resize window from the upper-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-left' title='Resize from the bottom-left corner' aria-label='Resize window from the bottom-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-right' title='Resize from the bottom-right corner' aria-label='Resize window from the bottom-right corner. Use arrow keys; hold Shift for larger changes.'></button>";
+            "</style><style>" +
+            "#nat-wrapper{box-sizing:border-box;max-inline-size:var(--nat-panel-max-width,calc(100vw - 20px));max-block-size:var(--nat-panel-max-height,calc(100dvh - 20px))}#nat-wrapper[data-runtime='tornpda'][data-edge]{margin:0}#nat-safe-area-probe{display:block;position:fixed;inset:0 auto auto 0;visibility:hidden;pointer-events:none;inline-size:0;block-size:0;min-inline-size:0!important;min-block-size:0!important;margin:0;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px);border:0}#nat-drag{min-width:0}#nat-title{flex:1 1 auto;min-width:0}#nat-body{overflow-x:clip;overflow-y:auto}#nat-content,.nat-grid,.nat-list,.nat-card,.nat-summary-card,.nat-search-panel,.nat-refresh,.nat-tabs,.nat-card-header,.nat-progress-header,.nat-award-row,.nat-progress-row,.nat-key-row,.nat-collection-switch{min-width:0;max-width:100%}.nat-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%}.nat-tab{width:100%;min-width:0}.nat-card-header>div,.nat-progress-header>div,.nat-total,.nat-card-note,.nat-progress-percent,.nat-award-row time,.nat-award-status{min-width:0;max-width:100%}.nat-progress-value{min-width:0}" +
+            "@container (max-width:430px){.nat-refresh{flex-wrap:wrap;gap:7px}.nat-sync-status{flex:1 1 100%}.nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}.nat-refresh-button{width:100%}.nat-search-panel{grid-template-columns:minmax(0,1fr)}.nat-search-count{justify-self:start}.nat-key-row{flex-direction:column}.nat-key-row button,.nat-theme-button{width:100%}.nat-card-header,.nat-progress-header{flex-wrap:wrap;gap:6px}.nat-total{justify-items:start}.nat-card-note{justify-self:start}.nat-award-row{grid-template-columns:4px minmax(0,1fr);gap:7px}.nat-award-row time,.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}.nat-progress-value{flex-wrap:wrap}.nat-tabs{gap:3px;padding:3px}.nat-tab{padding:7px 4px!important;font-size:10px!important}}@container (max-width:300px){#nat-body{padding:6px}.nat-card{padding:8px}.nat-tabs{gap:2px;padding:2px}.nat-tab{padding:6px 2px!important;font-size:9px!important}.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 4px!important;font-size:9px!important}.nat-search-panel{padding:6px}.nat-search-field{padding:0 5px}}" +
+            "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body' tabindex='0' aria-label='Awards Tracker content'><div id='nat-content'></div></main><i id='nat-safe-area-probe' aria-hidden='true'></i><span id='nat-resize-status' class='nat-sr-only' aria-live='polite'></span><button type='button' class='nat-resize' data-corner='top-left' title='Resize from the upper-left corner' aria-label='Resize window from the upper-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-left' title='Resize from the bottom-left corner' aria-label='Resize window from the bottom-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-right' title='Resize from the bottom-right corner' aria-label='Resize window from the bottom-right corner. Use arrow keys; hold Shift for larger changes.'></button>";
         document.body.appendChild(dashboard);
         state.dashboard = dashboard;
         updateRuntimeLayout();
