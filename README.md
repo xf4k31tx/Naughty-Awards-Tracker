@@ -46,9 +46,15 @@ Use the settings button to save or replace the Torn API key, switch theme, inspe
 
 The desktop widget is movable, resizable, and minimizable. TornPDA is detected through its native bridge; the mobile layout follows the live viewport, safe areas, and orientation. Small screens reflow award rows and controls instead of relying on cramped desktop dimensions. Its metadata declares both legacy and modern userscript storage/network grants for TornPDA and Tampermonkey compatibility.
 
+## TornPDA compatibility and storage
+
+On TornPDA, `PDA_storage` is the first-choice durable, per-script store. The tracker loads that namespace once during bootstrap and batches native saves for its API key, dashboard state, position, cached award data, and refresh time. When a native key is missing, the existing GM/Tampermonkey value is copied forward automatically; an existing native value remains authoritative. If native storage is unavailable or its quota is exceeded, the tracker falls back to compatible userscript storage so the latest change is not lost.
+
+The tracker treats native identity and layout separately. It waits for `flutterInAppWebViewPlatformReady`, then verifies `isTornPDA` before treating the session as TornPDA. A confirmed native session follows the live viewport, safe areas, and orientation, with an additional compact treatment for narrow TornPDA screens; it is not inferred merely from touch capability or a small desktop window. Requests use the declared legacy/modern GM network APIs when present and use TornPDA's native `PDA_httpGet` handler only after the bridge is ready. `PDA_storage` needs no extra userscript `@grant`.
+
 ## Data and privacy
 
-The script stores the Torn API key, UI preferences, cached awards data, and refresh timestamp in local userscript storage. Requests go directly to `api.torn.com`; no third-party award service receives your data.
+The script stores the Torn API key, UI preferences, cached awards data, and refresh timestamp in local per-script storage. Requests go directly to `api.torn.com`; no third-party award service receives your data.
 
 API keys are secrets. Revoke and replace a key if it may have been exposed.
 

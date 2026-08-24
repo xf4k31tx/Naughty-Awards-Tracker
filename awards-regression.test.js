@@ -12,6 +12,11 @@ const instrumented = source.replace(
     "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
+assert.match(source, /data-corner='bottom-left'[^>]*aria-label='Resize window from the bottom-left corner/, "Bottom-left resize control must remain accessible");
+assert.match(source, /data-corner='bottom-right'[^>]*aria-label='Resize window from the bottom-right corner/, "Bottom-right resize control must remain accessible");
+assert.match(source, /querySelectorAll\("\.nat-resize"\)\.forEach\(\(handle\) => handle\.addEventListener\("keydown"/, "Resize controls must retain keyboard support");
+assert.match(source, /#nat-body\{[^}]*overflow:auto[^}]*scrollbar-width:none[^}]*scrollbar-color:transparent transparent/, "The main scroll region must remain scrollable with hidden scrollbars");
+assert.match(source, /#nat-body::-webkit-scrollbar,\.nat-list::-webkit-scrollbar\{display:none!important/, "WebKit scrollbars must stay hidden");
 
 const sandbox = { window: {}, document: {}, console };
 sandbox.globalThis = sandbox;
