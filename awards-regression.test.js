@@ -7,6 +7,7 @@ const vm = require("node:vm");
 
 const file = path.join(__dirname, "Naughty Awards Tracker.user.js");
 const source = fs.readFileSync(file, "utf8");
+const readme = fs.readFileSync(path.join(__dirname, "README.md"), "utf8");
 const instrumented = source.replace(
     /    detectRuntimeAtStartup\(\);[\s\S]*?\n\}\)\(\);\s*$/,
     "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems };\n})();\n"
@@ -17,6 +18,11 @@ assert.match(source, /data-corner='bottom-right'[^>]*aria-label='Resize window f
 assert.match(source, /querySelectorAll\("\.nat-resize"\)\.forEach\(\(handle\) => handle\.addEventListener\("keydown"/, "Resize controls must retain keyboard support");
 assert.match(source, /#nat-body\{[^}]*overflow:auto[^}]*scrollbar-width:none[^}]*scrollbar-color:transparent transparent/, "The main scroll region must remain scrollable with hidden scrollbars");
 assert.match(source, /#nat-body::-webkit-scrollbar,\.nat-list::-webkit-scrollbar\{display:none!important/, "WebKit scrollbars must stay hidden");
+assert.match(source, /const LOG_PREFIX = "\[Naughty Awards Tracker\]";/, "Console diagnostics must retain a clear script prefix");
+assert.match(source, /function apiDiagnosticTarget\(url, method = "GET"\)/, "API logs must use a query-free target helper");
+assert.match(source, /API request started/, "API request lifecycle logs must remain available");
+assert.match(source, /Runtime confirmed/, "Runtime confirmation logs must remain available");
+assert.match(readme, /API keys, query strings, and request headers are never logged/, "README must document secret-safe Console diagnostics");
 
 const sandbox = { window: {}, document: {}, console };
 sandbox.globalThis = sandbox;

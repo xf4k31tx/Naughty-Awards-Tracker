@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/xf4k31tx/Naughty-Awards-Tracker
-// @version      1.3.2
+// @version      1.3.3
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       sharpsplinter [315311]
 // @match        https://www.torn.com/page.php?sid=awards*
@@ -17,7 +17,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.2";
+    const VERSION = "1.3.3";
     const BASE_URL = "https://api.torn.com/v2/";
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
@@ -56,6 +56,32 @@
             confirmed: false
         }
     };
+    const LOG_PREFIX = "[Naughty Awards Tracker]";
+
+    function redactDiagnostic(value) {
+        return String(value ?? "")
+            .replace(/([?&]key=)[^&\s]+/gi, "$1[redacted]")
+            .replace(/(\bkey\s*[:=]\s*)[^,\s}]+/gi, "$1[redacted]");
+    }
+    function safeDiagnosticError(error) {
+        return redactDiagnostic(error?.message || error || "Unknown error");
+    }
+    function apiDiagnosticTarget(url, method = "GET") {
+        try {
+            const target = new URL(String(url), window.location?.origin || "https://www.torn.com");
+            return { method: String(method).toUpperCase(), host: target.host, path: target.pathname };
+        } catch {
+            return { method: String(method).toUpperCase(), host: "unknown", path: "unknown" };
+        }
+    }
+    function logConsole(level, event, details = undefined) {
+        const logger = typeof console === "undefined" ? null : (typeof console[level] === "function" ? console[level] : console.log);
+        if (typeof logger === "function") logger.call(console, `${LOG_PREFIX} ${event}`, details);
+    }
+    const logInfo = (event, details) => logConsole("info", event, details);
+    const logDebug = (event, details) => logConsole("debug", event, details);
+    const logWarn = (event, details) => logConsole("warn", event, details);
+    const logError = (event, details, error) => logConsole("error", event, { ...(details || {}), error: safeDiagnosticError(error) });
 
     function getViewportMetrics() {
         const viewport = window.visualViewport;
@@ -87,8 +113,21 @@
         });
     }
     async function pdaCall(handler, ...args) {
-        if (!(await waitForPdaBridge())) throw new Error("TornPDA native bridge is unavailable.");
-        return window.flutter_inappwebview.callHandler(handler, ...args);
+        const handlerName = String(handler || "unknown");
+        if (!(await waitForPdaBridge())) {
+            const error = new Error("TornPDA native bridge is unavailable.");
+            logWarn("Native bridge unavailable", { handler: handlerName });
+            throw error;
+        }
+        logDebug("Native handler requested", { handler: handlerName });
+        try {
+            const response = await window.flutter_inappwebview.callHandler(handler, ...args);
+            logDebug("Native handler completed", { handler: handlerName, status: response?.status || "ok" });
+            return response;
+        } catch (error) {
+            logError("Native handler failed", { handler: handlerName }, error);
+            throw error;
+        }
     }
     function runtimeLabel() {
         if (!state.runtime.isTornPDA) return "Desktop browser";
@@ -118,22 +157,30 @@
             state.runtime.isTornPDA = false;
             state.runtime.confirmed = true;
             updateRuntimeLayout();
+            logInfo("Runtime confirmed", { runtime: "desktop", bridge: false, viewport: getViewportMetrics() });
             return;
         }
         try {
             const response = await pdaCall("isTornPDA");
             state.runtime.isTornPDA = response === true || response?.isTornPDA === true || response?.is_torn_pda === true;
-        } catch {
+        } catch (error) {
             state.runtime.isTornPDA = false;
+            logWarn("TornPDA runtime confirmation failed; using desktop mode", { error: safeDiagnosticError(error) });
         } finally {
             state.runtime.confirmed = true;
             updateRuntimeLayout();
             if (!state.isMinimized && state.dashboard) applySize();
+            logInfo("Runtime confirmed", {
+                runtime: state.runtime.isTornPDA ? "TornPDA" : "desktop",
+                bridge: isTornPdaBridgeAvailable(),
+                viewport: getViewportMetrics()
+            });
         }
     }
     function detectRuntimeAtStartup() {
         state.runtime.isTornPDA = false;
         state.runtime.confirmed = false;
+        logInfo("Runtime detection started", { version: VERSION, page: window.location?.pathname || "unknown", viewport: getViewportMetrics() });
         window.addEventListener("flutterInAppWebViewPlatformReady", () => void confirmTornPdaRuntime(), { once: true });
         window.setTimeout(() => void confirmTornPdaRuntime(), 0);
     }
@@ -167,9 +214,10 @@
         if (!PDA_STORE.loaded) {
             PDA_STORE.loaded = Promise.resolve(PDA_storage.loadAll()).then((values) => {
                 PDA_STORE.values = values && typeof values === "object" ? values : {};
+                logDebug("TornPDA storage loaded", { keys: Object.keys(PDA_STORE.values).length });
                 return PDA_STORE.values;
             }).catch((error) => {
-                console.warn("[NAT] PDA_storage unavailable; using userscript storage.", error);
+                logWarn("TornPDA storage unavailable; using userscript storage", { error: safeDiagnosticError(error) });
                 PDA_STORE.values = null;
                 return null;
             });
@@ -202,15 +250,17 @@
     async function pdaSetMany(values) {
         const stored = await loadPdaStorage();
         if (!stored || !hasPdaStorage()) {
+            logDebug("Storage save using userscript fallback", { keys: Object.keys(values || {}).length });
             Object.entries(values).forEach(([key, value]) => legacySet(key, value));
             return;
         }
         try {
             await PDA_storage.setMany(values);
             Object.assign(stored, values);
+            logDebug("TornPDA storage saved", { keys: Object.keys(values || {}).length });
         } catch (error) {
-            if (error?.code === "QuotaExceeded") console.warn("[NAT] PDA_storage quota exceeded; using userscript storage for this save.");
-            else console.warn("[NAT] PDA_storage write failed; using userscript storage.", error);
+            if (error?.code === "QuotaExceeded") logWarn("TornPDA storage quota exceeded; using userscript storage", { keys: Object.keys(values || {}).length });
+            else logWarn("TornPDA storage write failed; using userscript storage", { keys: Object.keys(values || {}).length, error: safeDiagnosticError(error) });
             Object.entries(values).forEach(([key, value]) => legacySet(key, value));
         }
     }
@@ -219,25 +269,42 @@
     }
     function requestJson(url) {
         return new Promise((resolve, reject) => {
+            const target = apiDiagnosticTarget(url);
+            const startedAt = Date.now();
+            const fail = (event, error, response = null) => {
+                logError(event, { ...target, status: Number(response?.status) || null, durationMs: Date.now() - startedAt }, error);
+                reject(error);
+            };
             const request = {
                 method: "GET", url, headers: { Accept: "application/json" },
                 onload: (response) => {
                     if (response.status < 200 || response.status >= 300) {
-                        reject(new Error("HTTP " + response.status));
+                        fail("API request failed", new Error("HTTP " + response.status), response);
                         return;
                     }
                     try {
                         const data = JSON.parse(response.responseText);
-                        if (data?.error) reject(new Error(data.error.error || "Torn API error"));
-                        else resolve(data);
-                    } catch { reject(new Error("Unable to parse API response")); }
+                        if (data?.error) {
+                            fail("API request rejected", new Error(data.error.error || "Torn API error"), response);
+                            return;
+                        }
+                        logInfo("API request completed", { ...target, status: Number(response.status) || 200, durationMs: Date.now() - startedAt });
+                        resolve(data);
+                    } catch (error) { fail("API response parse failed", new Error("Unable to parse API response"), response); }
                 },
-                onerror: () => reject(new Error("Network request failed"))
+                onerror: (error) => fail("API network request failed", new Error("Network request failed"), error)
             };
-            if (typeof GM_xmlhttpRequest === "function") GM_xmlhttpRequest(request);
-            else if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") GM.xmlHttpRequest(request);
+            if (typeof GM_xmlhttpRequest === "function") {
+                logInfo("API request started", { ...target, transport: "GM_xmlhttpRequest" });
+                GM_xmlhttpRequest(request);
+            }
+            else if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+                logInfo("API request started", { ...target, transport: "GM.xmlHttpRequest" });
+                GM.xmlHttpRequest(request);
+            }
             else {
-                pdaCall("PDA_httpGet", url, request.headers).then(request.onload).catch((error) => reject(error));
+                logInfo("API request started", { ...target, transport: "PDA_httpGet" });
+                pdaCall("PDA_httpGet", url, request.headers).then(request.onload).catch((error) => fail("Native API request failed", error));
             }
         });
     }
@@ -309,9 +376,14 @@
             .sort((a, b) => b.percent - a.percent || a.target - b.target).slice(0, 5);
     }
     async function refreshAwards() {
-        if (!state.apiKey || state.refreshInFlight || state.isMinimized) return;
+        if (!state.apiKey || state.refreshInFlight || state.isMinimized) {
+            logDebug("Awards refresh skipped", { hasApiKey: Boolean(state.apiKey), inFlight: state.refreshInFlight, minimized: state.isMinimized });
+            return;
+        }
         state.refreshInFlight = true;
         state.error = "";
+        const startedAt = Date.now();
+        logInfo("Awards refresh started", { cached: Boolean(state.cache), runtime: runtimeLabel() });
         render();
         try {
             const requests = [
@@ -336,8 +408,10 @@
             void pdaSetMany({ [STORAGE.cache]: state.cache, [STORAGE.refreshedAt]: state.refreshedAt });
         } catch (error) {
             state.error = error.message || "Unable to refresh awards";
+            logError("Awards refresh failed", { durationMs: Date.now() - startedAt }, error);
         } finally {
             state.refreshInFlight = false;
+            if (!state.error) logInfo("Awards refresh completed", { durationMs: Date.now() - startedAt, medals: state.cache?.medals?.totalEarned || 0, honors: state.cache?.honors?.totalEarned || 0 });
             render();
         }
     }
@@ -814,6 +888,7 @@
         state.position = position;
         state.cache = cache;
         state.refreshedAt = Number(refreshedAt || 0);
+        logInfo("Bootstrap completed", { version: VERSION, hasApiKey: Boolean(state.apiKey), cached: Boolean(state.cache), runtime: runtimeLabel() });
         initializeDashboard();
         scheduleDailyRefresh();
     }

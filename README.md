@@ -52,6 +52,10 @@ On TornPDA, `PDA_storage` is the first-choice durable, per-script store. The tra
 
 The tracker treats native identity and layout separately. It waits for `flutterInAppWebViewPlatformReady`, then verifies `isTornPDA` before treating the session as TornPDA. A confirmed native session follows the live viewport, safe areas, and orientation, with an additional compact treatment for narrow TornPDA screens; it is not inferred merely from touch capability or a small desktop window. Requests use the declared legacy/modern GM network APIs when present and use TornPDA's native `PDA_httpGet` handler only after the bridge is ready. `PDA_storage` needs no extra userscript `@grant`.
 
+## Console diagnostics
+
+The browser Console records startup/runtime confirmation, TornPDA bridge and storage fallbacks, API request start/completion duration, refresh lifecycle, and failures under the `[Naughty Awards Tracker]` prefix. Request logs include only method, host, and path; API keys, query strings, and request headers are never logged.
+
 ## Data and privacy
 
 The script stores the Torn API key, UI preferences, cached awards data, and refresh timestamp in local per-script storage. Requests go directly to `api.torn.com`; no third-party award service receives your data.
