@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
-// @version      1.3.12
+// @version      1.3.13
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       SharpSplinter [315311]
 // @license      MIT
@@ -23,13 +23,15 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.12";
+    const VERSION = "1.3.13";
     const BASE_URL = "https://api.torn.com/v2/";
     const PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_";
     const NATIVE_REMINDER_ID = 6324;
     const BACKUP_NAMESPACE = "naughty-awards-tracker.backup";
     const BACKUP_SCHEMA_VERSION = 1;
     const BACKUP_MAX_BYTES = 8 * 1024 * 1024;
+    const KEYBOARD_OVERLAY_MIN_HEIGHT_LOSS = 96;
+    const KEYBOARD_OVERLAY_MIN_HEIGHT_RATIO = .18;
     const STORAGE = {
         key: "NAT_TORN_API_KEY",
         dashboard: "NAT_DASHBOARD_STATE",
@@ -70,7 +72,16 @@
         searchQueries: { honors: "", medals: "" }, collectionViews: { honors: "completed", medals: "completed" }, searchSaveTimer: null,
         runtime: {
             isTornPDA: false,
-            confirmed: false
+            confirmed: false,
+            keyboard: {
+                focused: false,
+                active: false,
+                stableViewport: null,
+                layoutViewport: null,
+                releaseTimer: null,
+                nativeOverlaySupported: false,
+                nativeOverlayEnabled: false
+            }
         }
     };
     const LOG_PREFIX = "[Naughty Awards Tracker]";
@@ -110,6 +121,103 @@
             top: Math.round(Number(viewport?.offsetTop) || 0),
             orientation: height >= width ? "portrait" : "landscape"
         };
+    }
+    function copyViewportMetrics(viewport) {
+        const width = Math.max(1, Math.round(Number(viewport?.width) || 1));
+        const height = Math.max(1, Math.round(Number(viewport?.height) || 1));
+        return {
+            width, height,
+            left: Math.round(Number(viewport?.left) || 0),
+            top: Math.round(Number(viewport?.top) || 0),
+            orientation: viewport?.orientation === "landscape" ? "landscape" : (viewport?.orientation === "portrait" ? "portrait" : (height >= width ? "portrait" : "landscape"))
+        };
+    }
+    function keyboardState() {
+        if (!state.runtime.keyboard || typeof state.runtime.keyboard !== "object") {
+            state.runtime.keyboard = { focused: false, active: false, stableViewport: null, layoutViewport: null, releaseTimer: null, nativeOverlaySupported: false, nativeOverlayEnabled: false };
+        }
+        return state.runtime.keyboard;
+    }
+    function isTextEntryTarget(target) {
+        if (!target || target.nodeType !== 1 || typeof target.matches !== "function") return false;
+        if (target.matches("textarea,[contenteditable='true']")) return true;
+        if (!target.matches("input")) return false;
+        return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(String(target.type || "text").toLowerCase());
+    }
+    function isKeyboardOverlayResize(viewport, stableViewport) {
+        const current = copyViewportMetrics(viewport);
+        const stable = copyViewportMetrics(stableViewport);
+        const widthChanged = Math.abs(current.width - stable.width) > Math.max(72, stable.width * .18);
+        const heightLoss = stable.height - current.height;
+        return !widthChanged && heightLoss >= Math.max(KEYBOARD_OVERLAY_MIN_HEIGHT_LOSS, stable.height * KEYBOARD_OVERLAY_MIN_HEIGHT_RATIO);
+    }
+    function enableNativeKeyboardOverlay() {
+        const keyboard = keyboardState();
+        const virtualKeyboard = typeof navigator === "undefined" ? null : navigator.virtualKeyboard;
+        keyboard.nativeOverlaySupported = Boolean(state.runtime.isTornPDA && virtualKeyboard && "overlaysContent" in virtualKeyboard);
+        keyboard.nativeOverlayEnabled = false;
+        if (!keyboard.nativeOverlaySupported) return false;
+        try {
+            virtualKeyboard.overlaysContent = true;
+            keyboard.nativeOverlayEnabled = virtualKeyboard.overlaysContent === true;
+            logDebug("Native keyboard overlay " + (keyboard.nativeOverlayEnabled ? "enabled" : "unavailable"));
+        } catch (error) {
+            logDebug("Native keyboard overlay unavailable", { error: safeDiagnosticError(error) });
+        }
+        return keyboard.nativeOverlayEnabled;
+    }
+    function getPanelViewportMetrics() {
+        const keyboard = keyboardState();
+        if (state.runtime.isTornPDA && keyboard.active && keyboard.layoutViewport) return copyViewportMetrics(keyboard.layoutViewport);
+        return getViewportMetrics();
+    }
+    function updateKeyboardOverlayState(viewport = getViewportMetrics(), forceLayout = false) {
+        const keyboard = keyboardState();
+        if (!state.runtime.isTornPDA) {
+            keyboard.active = false;
+            keyboard.layoutViewport = null;
+            keyboard.stableViewport = null;
+            return false;
+        }
+        const current = copyViewportMetrics(viewport);
+        if (forceLayout || !keyboard.stableViewport) {
+            keyboard.active = false;
+            keyboard.layoutViewport = null;
+            keyboard.stableViewport = current;
+            return false;
+        }
+        if (keyboard.focused && isKeyboardOverlayResize(current, keyboard.stableViewport)) {
+            if (!keyboard.active) logDebug("Virtual keyboard overlay detected", { viewport: current, layoutViewport: keyboard.stableViewport });
+            keyboard.active = true;
+            keyboard.layoutViewport = copyViewportMetrics(keyboard.stableViewport);
+            return true;
+        }
+        if (keyboard.active && isKeyboardOverlayResize(current, keyboard.stableViewport)) return true;
+        if (keyboard.active) logDebug("Virtual keyboard overlay released", { viewport: current });
+        keyboard.active = false;
+        keyboard.layoutViewport = null;
+        keyboard.stableViewport = current;
+        return false;
+    }
+    function prepareKeyboardOverlay(target) {
+        if (!state.runtime.isTornPDA || !isTextEntryTarget(target)) return;
+        const keyboard = keyboardState();
+        clearTimeout(keyboard.releaseTimer);
+        if (!keyboard.focused && !keyboard.active) keyboard.stableViewport = copyViewportMetrics(getViewportMetrics());
+        keyboard.focused = true;
+    }
+    function releaseKeyboardOverlay() {
+        if (!state.runtime.isTornPDA) return;
+        const keyboard = keyboardState();
+        clearTimeout(keyboard.releaseTimer);
+        keyboard.releaseTimer = window.setTimeout(() => {
+            const activeElement = document.activeElement;
+            if (state.dashboard?.contains(activeElement) && isTextEntryTarget(activeElement)) return;
+            keyboard.focused = false;
+            const overlayActive = updateKeyboardOverlayState(getViewportMetrics());
+            updateRuntimeLayout();
+            if (state.dashboard && !overlayActive) state.isMinimized ? applyPosition() : applySize();
+        }, 180);
     }
     function isTornPdaBridgeAvailable() {
         return Boolean(window.flutter_inappwebview && typeof window.flutter_inappwebview.callHandler === "function");
@@ -236,11 +344,11 @@
     }
     function runtimeDescription() {
         return state.runtime.isTornPDA
-            ? "Native TornPDA bridge detected. The panel follows your active device viewport."
+            ? (keyboardState().nativeOverlayEnabled ? "Native TornPDA bridge detected. The native keyboard overlays the panel while you type." : "Native TornPDA bridge detected. The panel follows your active device viewport.")
             : "Standard desktop browser layout is active.";
     }
     function screenSizeLabel() {
-        const viewport = getViewportMetrics();
+        const viewport = getPanelViewportMetrics();
         return formatInteger(viewport.width) + " × " + formatInteger(viewport.height) + " px · " + viewport.orientation;
     }
     function storageMethodLabel() {
@@ -257,11 +365,12 @@
     function updateRuntimeLayout() {
         const dashboard = state.dashboard;
         if (!dashboard) return;
-        const viewport = getViewportMetrics();
+        const viewport = getPanelViewportMetrics();
         const bounds = getPanelBounds();
         dashboard.dataset.runtime = state.runtime.isTornPDA ? "tornpda" : "desktop";
         dashboard.dataset.orientation = viewport.orientation;
         dashboard.dataset.compact = state.runtime.isTornPDA && (bounds.width < 480 || bounds.height < 520) ? "true" : "false";
+        dashboard.dataset.keyboardOverlay = state.runtime.isTornPDA && keyboardState().active ? "true" : "false";
         dashboard.style.setProperty("--nat-viewport-width", viewport.width + "px");
         dashboard.style.setProperty("--nat-viewport-height", viewport.height + "px");
         dashboard.style.setProperty("--nat-panel-max-width", Math.max(1, Math.floor(bounds.width)) + "px");
@@ -293,6 +402,8 @@
             logWarn("TornPDA runtime confirmation failed; using desktop mode", { error: safeDiagnosticError(error) });
         } finally {
             state.runtime.confirmed = true;
+            updateKeyboardOverlayState(getViewportMetrics(), true);
+            if (state.runtime.isTornPDA) enableNativeKeyboardOverlay();
             const adoptedInjectedKey = state.runtime.isTornPDA && adoptInjectedPdaApiKey();
             updateRuntimeLayout();
             if (state.dashboard) state.isMinimized ? applyPosition() : applySize();
@@ -368,7 +479,7 @@
         };
     }
     function getPanelBounds() {
-        const viewport = getViewportMetrics();
+        const viewport = getPanelViewportMetrics();
         return panelBounds(viewport, state.runtime.isTornPDA ? getSafeAreaInsets() : {}, state.runtime.isTornPDA ? 6 : 10);
     }
     function clampPanelSize(size, fallback, limits) {
@@ -1040,7 +1151,7 @@
             (usingInjectedKey ? "<p class='nat-key-source'>A TornPDA injected API key is active and is never shown or stored by this tracker.</p>" : "") +
             "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:00 UTC</strong><p>Automatic refresh pauses while the tab is inactive and resumes safely when it returns.</p></div>" +
             "<div class='nat-setting-note nat-runtime-note'><span>Runtime</span><strong data-runtime-label>" + runtimeLabel() + "</strong><p data-runtime-detail>" + runtimeDescription() + "</p></div>" +
-            "<div class='nat-setting-note'><span>Screen Size</span><strong data-screen-size>" + screenSizeLabel() + "</strong><p>Live visual viewport.</p></div>" +
+            "<div class='nat-setting-note'><span>Screen Size</span><strong data-screen-size>" + screenSizeLabel() + "</strong><p>Live layout viewport; it stays stable while the native keyboard is open.</p></div>" +
             "<div class='nat-setting-note'><span>Storage Method</span><strong data-storage-method>" + storageMethodLabel() + "</strong><p data-storage-detail>" + storageMethodDescription() + "</p></div>" +
             "<label class='nat-storage-toggle' for='nat-use-legacy-gm-storage'><input id='nat-use-legacy-gm-storage' type='checkbox' data-action='toggle-legacy-storage'" + legacyChecked + "><span><strong>Use legacy GM storage</strong><small>Moves current tracker data before switching the primary store.</small></span></label>" +
             "<div class='nat-setting-note nat-backup-note'><span>Backup &amp; Restore</span><strong>Local tracker data</strong><p>Downloads your cache, layout, and preferences. TornPDA injected keys are never included.</p></div>" +
@@ -1274,7 +1385,7 @@
         };
     }
     function defaultSize(limits) {
-        const viewport = getViewportMetrics();
+        const viewport = getPanelViewportMetrics();
         const bounds = getPanelBounds();
         if (state.runtime.isTornPDA) {
             const topOffset = viewport.orientation === "portrait" ? 60 : 12;
@@ -1293,7 +1404,7 @@
     function applyPosition(position = state.position) {
         const dashboard = state.dashboard;
         if (!dashboard) return;
-        const viewport = getViewportMetrics();
+        const viewport = getPanelViewportMetrics();
         const bounds = getPanelBounds();
         const rect = dashboard.getBoundingClientRect();
         const defaultTop = bounds.top + (state.runtime.isTornPDA && viewport.orientation === "portrait" ? 60 : 20);
@@ -1558,6 +1669,11 @@
         const dashboard = state.dashboard;
         let dragging = false, moved = false, dragPointerId = null, offsetX = 0, offsetY = 0, dragStartX = 0, dragStartY = 0;
         const isPrimaryPointer = (event) => event.isPrimary && (event.pointerType !== "mouse" || event.button === 0);
+        dashboard.addEventListener("pointerdown", (event) => prepareKeyboardOverlay(event.target), true);
+        dashboard.addEventListener("focusin", (event) => prepareKeyboardOverlay(event.target));
+        dashboard.addEventListener("focusout", (event) => {
+            if (isTextEntryTarget(event.target)) releaseKeyboardOverlay();
+        });
         dashboard.addEventListener("pointerdown", (event) => {
             if (!state.isMinimized && !event.target.closest("#nat-drag")) return;
             if (!isPrimaryPointer(event) || event.target.closest("#nat-minimize")) return;
@@ -1666,16 +1782,18 @@
         document.addEventListener("pointerup", finishResizing);
         document.addEventListener("pointercancel", finishResizing);
         let viewportFrame = 0;
-        const refreshViewportLayout = () => {
+        const refreshViewportLayout = (reason = "resize") => {
             cancelAnimationFrame(viewportFrame);
             viewportFrame = requestAnimationFrame(() => {
+                const keyboardOverlay = updateKeyboardOverlayState(getViewportMetrics(), reason === "orientationchange");
                 updateRuntimeLayout();
+                if (keyboardOverlay) return;
                 if (state.isMinimized) applyPosition();
                 else applySize();
             });
         };
         window.addEventListener("resize", refreshViewportLayout);
-        window.addEventListener("orientationchange", refreshViewportLayout);
+        window.addEventListener("orientationchange", () => refreshViewportLayout("orientationchange"));
         window.visualViewport?.addEventListener("resize", refreshViewportLayout);
         window.visualViewport?.addEventListener("scroll", refreshViewportLayout);
     }
@@ -1705,7 +1823,7 @@
             "</style><style>" +
             "#nat-wrapper{isolation:isolate}#nat-drag{touch-action:none}#nat-wrapper[data-theme='light']{background:linear-gradient(155deg,#d7e0e9,#c5d0dc);color:#142238;border-color:#96aabd;box-shadow:0 14px 32px rgba(29,46,68,.24)}#nat-wrapper[data-theme='light'] #nat-drag{background:linear-gradient(90deg,#aebdce,#95a8bb);border-color:#8197ad;color:#112036}#nat-wrapper[data-theme='light'] #nat-body{background:linear-gradient(180deg,rgba(178,194,211,.62),rgba(205,216,228,.48))}#nat-wrapper[data-theme='light'] .nat-card{background:linear-gradient(145deg,#e1e8ef,#d5e0ea);border-color:#a9bacb;box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 5px 13px rgba(34,53,77,.13)}#nat-wrapper[data-theme='light'] .nat-card-header h2,#nat-wrapper[data-theme='light'] .nat-sync-status strong,#nat-wrapper[data-theme='light'] .nat-setting-note strong{color:#142238}#nat-wrapper[data-theme='light'] .nat-refresh{color:#465b73}#nat-wrapper[data-theme='light'] .nat-sync-status small,#nat-wrapper[data-theme='light'] .nat-total span,#nat-wrapper[data-theme='light'] .nat-description,#nat-wrapper[data-theme='light'] .nat-progress-value,#nat-wrapper[data-theme='light'] .nat-empty-card p,#nat-wrapper[data-theme='light'] .nat-setting-note p{color:#4c6076}#nat-wrapper[data-theme='light'] button{background:#c8d5e2;color:#142238;border-color:#859bb4}#nat-wrapper[data-theme='light'] .nat-resize{color:#365f99!important}#nat-wrapper[data-theme='light'] .nat-tabs{background:rgba(173,190,207,.64);border-color:#93a8bd}#nat-wrapper[data-theme='light'] .nat-tab{color:#3c526b!important}#nat-wrapper[data-theme='light'] .nat-tab.active{background:#365f99!important;border-color:#2b568f!important;color:#fff!important}#nat-wrapper[data-theme='light'] .nat-collection-track,#nat-wrapper[data-theme='light'] .nat-progress-track{background:#bdcad8;border-color:#9eafc0}#nat-wrapper[data-theme='light'] .nat-chip,#nat-wrapper[data-theme='light'] .nat-setting-note{background:#d5dfe9;border-color:#a7b8c9}#nat-wrapper[data-theme='light'] .nat-section-label{color:#526981}#nat-wrapper[data-theme='light'] .nat-award-row,#nat-wrapper[data-theme='light'] .nat-progress-row{border-color:#b7c5d3}#nat-wrapper[data-theme='light'] .nat-award-row:hover{background:rgba(104,133,166,.14)}#nat-wrapper[data-theme='light'] .nat-award-row time{border-color:#a9bacb;color:#42576f}#nat-wrapper[data-theme='light'] .nat-settings label{color:#142238}#nat-wrapper[data-theme='light'] .nat-key-row input{background:#e3e9ef;color:#142238;border-color:#91a6bc}" +
             ".nat-search-panel{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:5px 8px;align-items:center;margin:0 0 11px;padding:8px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-search-label{grid-column:1/-1;color:#a7c3e5;font-size:9px;font-weight:800;letter-spacing:.07em;text-transform:uppercase}.nat-search-field{display:flex;align-items:center;gap:6px;min-width:0;padding:0 7px;border:1px solid #4d6688;border-radius:7px;background:#101a29;transition:border-color .15s ease,box-shadow .15s ease}.nat-search-field:focus-within{border-color:#7ca8dc;box-shadow:0 0 0 3px rgba(98,150,210,.2)}.nat-search-field>span{color:#8eb5e5;font-size:15px;line-height:1}.nat-search-field input{width:100%;min-width:0;min-height:34px;border:0!important;outline:0;background:transparent!important;color:#f1f6ff!important;font:inherit;font-size:11px}.nat-search-field input::placeholder{color:#71839b}.nat-search-clear{width:26px;min-width:26px!important;min-height:26px!important;padding:0!important;border-color:transparent!important;background:transparent!important;color:#aebed3!important;font-size:18px!important;line-height:1}.nat-search-count{color:#8eb5e5;font-size:9px;font-weight:800;white-space:nowrap}.nat-summary-card [data-search-results]{min-width:0}#nat-wrapper[data-theme='light'] .nat-search-panel{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-search-label,#nat-wrapper[data-theme='light'] .nat-search-count{color:#385a7e}#nat-wrapper[data-theme='light'] .nat-search-field{background:#e6ecf2;border-color:#93a8bd}#nat-wrapper[data-theme='light'] .nat-search-field:focus-within{border-color:#4c78ad;box-shadow:0 0 0 3px rgba(72,112,162,.18)}#nat-wrapper[data-theme='light'] .nat-search-field input{color:#142238!important}#nat-wrapper[data-theme='light'] .nat-search-field input::placeholder{color:#667a90}#nat-wrapper[data-theme='light'] .nat-search-clear{color:#415b79!important}" +
-            "#nat-wrapper[data-runtime='tornpda']{border-radius:14px;max-width:calc(100vw - 12px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));max-height:calc(100dvh - 12px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));box-shadow:0 10px 28px rgba(0,0,0,.48)}#nat-wrapper[data-runtime='tornpda'][data-edge='left']{margin-left:env(safe-area-inset-left, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='right']{margin-right:env(safe-area-inset-right, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='top']{margin-top:env(safe-area-inset-top, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='bottom']{margin-bottom:env(safe-area-inset-bottom, 0px)}#nat-wrapper[data-runtime='tornpda'] #nat-drag{min-height:52px;padding:10px 12px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] #nat-minimize{width:44px;height:40px;flex-basis:44px;font-size:23px}#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:10px;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch}#nat-wrapper[data-runtime='tornpda'] #nat-content{width:100%!important;transform:none!important}#nat-wrapper[data-runtime='tornpda'] button:not(.nat-search-clear){min-height:40px;padding:9px 11px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-icon-button{width:40px;min-height:40px;font-size:17px!important}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{min-height:48px;padding:4px;gap:5px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{min-height:38px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:12px}#nat-wrapper[data-runtime='tornpda'] .nat-list{max-height:none;overflow:visible}#nat-wrapper[data-runtime='tornpda'] .nat-resize{width:36px;min-width:36px!important;height:36px;min-height:36px!important;touch-action:none}#nat-wrapper[data-runtime='tornpda'] .nat-search-field input{min-height:40px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-search-clear{width:32px;min-width:32px!important;min-height:32px!important;font-size:21px!important}" +
+            "#nat-wrapper[data-runtime='tornpda']{border-radius:14px;max-width:calc(100vw - 12px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));max-height:calc(100dvh - 12px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));box-shadow:0 10px 28px rgba(0,0,0,.48)}#nat-wrapper[data-runtime='tornpda'][data-edge='left']{margin-left:env(safe-area-inset-left, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='right']{margin-right:env(safe-area-inset-right, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='top']{margin-top:env(safe-area-inset-top, 0px)}#nat-wrapper[data-runtime='tornpda'][data-edge='bottom']{margin-bottom:env(safe-area-inset-bottom, 0px)}#nat-wrapper[data-runtime='tornpda'][data-keyboard-overlay='true']{max-block-size:var(--nat-panel-max-height)}#nat-wrapper[data-runtime='tornpda'] #nat-drag{min-height:52px;padding:10px 12px;touch-action:none}#nat-wrapper[data-runtime='tornpda'] #nat-minimize{width:44px;height:40px;flex-basis:44px;font-size:23px}#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:10px;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch}#nat-wrapper[data-runtime='tornpda'] #nat-content{width:100%!important;transform:none!important}#nat-wrapper[data-runtime='tornpda'] button:not(.nat-search-clear){min-height:40px;padding:9px 11px;font-size:12px}#nat-wrapper[data-runtime='tornpda'] .nat-icon-button{width:40px;min-height:40px;font-size:17px!important}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{min-height:48px;padding:4px;gap:5px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{min-height:38px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:12px}#nat-wrapper[data-runtime='tornpda'] .nat-list{max-height:none;overflow:visible}#nat-wrapper[data-runtime='tornpda'] .nat-resize{width:36px;min-width:36px!important;height:36px;min-height:36px!important;touch-action:none}#nat-wrapper[data-runtime='tornpda'] input,#nat-wrapper[data-runtime='tornpda'] textarea,#nat-wrapper[data-runtime='tornpda'] select{font-size:16px!important;-webkit-user-select:text;user-select:text}#nat-wrapper[data-runtime='tornpda'] .nat-search-field input{min-height:40px}#nat-wrapper[data-runtime='tornpda'] .nat-search-clear{width:32px;min-width:32px!important;min-height:32px!important;font-size:21px!important}" +
             "@container (max-width:430px){#nat-wrapper[data-runtime='tornpda'] #nat-body{padding:8px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh{flex-wrap:wrap;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-sync-status{flex:1 1 100%}#nat-wrapper[data-runtime='tornpda'] .nat-top-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) 40px;gap:7px}#nat-wrapper[data-runtime='tornpda'] .nat-refresh-button{width:100%}#nat-wrapper[data-runtime='tornpda'] .nat-tabs{gap:3px;padding:3px}#nat-wrapper[data-runtime='tornpda'] .nat-tab{padding:7px 5px!important;font-size:10px!important}#nat-wrapper[data-runtime='tornpda'] .nat-card{padding:10px}#nat-wrapper[data-runtime='tornpda'] .nat-search-panel{grid-template-columns:minmax(0,1fr)}#nat-wrapper[data-runtime='tornpda'] .nat-search-count{justify-self:start}#nat-wrapper[data-runtime='tornpda'] .nat-card-header{gap:6px}#nat-wrapper[data-runtime='tornpda'] .nat-total strong{font-size:11px!important}}@media (max-height:560px){#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-drag{min-height:44px;padding:7px 10px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-minimize{width:40px;height:34px;flex-basis:40px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] #nat-body{padding:7px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] .nat-card{padding:9px}#nat-wrapper[data-runtime='tornpda'][data-orientation='landscape'] button:not(.nat-search-clear){min-height:34px;padding:7px 9px;font-size:11px}}" +
             ".nat-collection-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:0 0 10px;padding:4px;border:1px solid #3a5274;border-radius:9px;background:rgba(8,15,25,.28)}.nat-collection-tab{display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0;background:transparent!important;border-color:transparent!important;color:#aebed3!important}.nat-collection-tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.nat-collection-tab b{display:grid;place-items:center;min-width:22px;padding:2px 5px;border-radius:999px;color:#c9d9ef;background:rgba(118,151,193,.2);font-size:9px}.nat-collection-tab.active{background:#365d99!important;border-color:#5279b3!important;color:#fff!important;box-shadow:0 3px 8px rgba(6,12,22,.28)}.nat-collection-tab.active b{color:#fff;background:rgba(255,255,255,.18)}.nat-award-meta{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px;color:#8fa7c3;font-size:9px;font-weight:750}.nat-award-meta span{padding:2px 5px;border:1px solid #38506e;border-radius:999px;background:rgba(9,16,26,.26)}.nat-award-rarity{color:inherit}.nat-award-status{align-self:start;margin-top:1px;padding:3px 5px;border:1px solid #5c6680;border-radius:5px;color:#b8c7dc;background:rgba(94,111,140,.16);font-size:9px;font-weight:800;line-height:1.2;white-space:nowrap}#nat-wrapper[data-theme='light'] .nat-collection-switch{background:rgba(171,188,205,.34);border-color:#a2b3c5}#nat-wrapper[data-theme='light'] .nat-collection-tab{color:#3c526b!important}#nat-wrapper[data-theme='light'] .nat-collection-tab.active{background:#365f99!important;border-color:#2b568f!important;color:#fff!important}#nat-wrapper[data-theme='light'] .nat-award-meta{color:#526981}#nat-wrapper[data-theme='light'] .nat-award-meta span{border-color:#a9bacb;background:#dce5ee}#nat-wrapper[data-theme='light'] .nat-award-status{border-color:#a0afbf;color:#3f536b;background:#d7e0e9}@container (max-width:380px){.nat-collection-switch{gap:3px;padding:3px}.nat-collection-tab{padding:6px 5px!important;font-size:10px!important}.nat-award-status{grid-column:2;justify-self:start;margin:1px 0 0}}" +
             "</style><style>" +

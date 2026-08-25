@@ -11,10 +11,10 @@ const source = fs.readFileSync(file, "utf8");
 const readme = fs.readFileSync(path.join(__dirname, "README.md"), "utf8");
 const instrumented = source.replace(
     /    detectRuntimeAtStartup\(\);[\s\S]*?\n\}\)\(\);\s*$/,
-    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition };\n})();\n"
+    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
-assert.match(source, /@version\s+1\.3\.12/, "Userscript metadata must reflect the minimized-launcher release");
+assert.match(source, /@version\s+1\.3\.13/, "Userscript metadata must reflect the keyboard-overlay release");
 assert.match(source, /@license\s+MIT/, "metadata must declare the MIT license");
 assert.match(source, /https:\/\/github\.com\/SharpSplinter\/Naughty-Awards-Tracker/, "metadata must use the renamed GitHub account");
 assert.match(source, /https:\/\/raw\.githubusercontent\.com\/SharpSplinter\/Naughty-Awards-Tracker\/main/, "metadata must update from the renamed account");
@@ -33,6 +33,13 @@ assert.match(source, /function panelBounds\(viewport, safeArea = \{\}, gutter = 
 assert.match(source, /#nat-safe-area-probe\{[^}]*padding:env\(safe-area-inset-top/, "Safe-area insets must be measurable by the layout clamp");
 assert.match(source, /#nat-wrapper\{box-sizing:border-box;max-inline-size:var\(--nat-panel-max-width/, "The panel must cap its border box to the live viewport bounds");
 assert.match(source, /window\.visualViewport\?\.addEventListener\("scroll", refreshViewportLayout\)/, "Visual viewport movement must re-clamp the panel");
+assert.match(source, /function isKeyboardOverlayResize\(viewport, stableViewport\)/, "TornPDA keyboard resizes must be identified before reflowing the panel");
+assert.match(source, /navigator\.virtualKeyboard/, "TornPDA must feature-detect the native virtual keyboard API");
+assert.match(source, /virtualKeyboard\.overlaysContent = true/, "Supported TornPDA runtimes must opt into native keyboard overlay mode");
+assert.match(source, /if \(keyboardOverlay\) return;/, "Keyboard visual-viewport changes must not resize or move the active panel");
+assert.match(source, /dashboard\.addEventListener\("focusin", \(event\) => prepareKeyboardOverlay\(event\.target\)\)/, "Text focus must preserve the pre-keyboard viewport before the native keyboard opens");
+assert.match(source, /font-size:16px!important;-webkit-user-select:text/, "TornPDA text inputs must avoid mobile browser auto-zoom while typing");
+assert.match(readme, /navigator\.virtualKeyboard\.overlaysContent/, "README must document the native keyboard overlay behavior");
 assert.match(source, /if \(state\.isMinimized\) applyPosition\(\);\s*else applySize\(\);/, "Minimized panels must also remain inside live viewport bounds");
 assert.match(source, /function restoreMinimizedWidget\(\)/, "Minimized launchers must use one restore path");
 assert.match(source, /dashboard\.addEventListener\("pointerdown", \(event\) => \{\s*if \(!state\.isMinimized && !event\.target\.closest\("#nat-drag"\)\) return;/, "The entire minimized launcher must start a drag");
@@ -97,7 +104,7 @@ vm.runInNewContext(instrumented, sandbox, { filename: file });
 const {
     buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize,
     state, STORAGE, STORAGE_DELETE, createStorageAdapter, loadStoragePreference,
-    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition
+    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize
 } = sandbox.__natTest;
 
 const portraitBounds = panelBounds(
@@ -118,6 +125,22 @@ assert.equal(portraitSize.height, portraitBounds.height, "Oversized saved height
 const tinyBounds = panelBounds({ left: 0, top: 0, width: 20, height: 20 }, { left: 100, right: 100, top: 100, bottom: 100 }, 6);
 assert.equal(tinyBounds.width, 1, "Extreme insets must not create negative or horizontal-overflowing bounds");
 assert.equal(tinyBounds.height, 1, "Extreme insets must not create negative or vertically-overflowing bounds");
+
+assert.equal(
+    isKeyboardOverlayResize({ left: 0, top: 0, width: 390, height: 360, orientation: "portrait" }, { left: 0, top: 0, width: 390, height: 840, orientation: "portrait" }),
+    true,
+    "A focused TornPDA viewport that only loses substantial height must be treated as a native keyboard overlay"
+);
+assert.equal(
+    isKeyboardOverlayResize({ left: 0, top: 0, width: 844, height: 390, orientation: "landscape" }, { left: 0, top: 0, width: 390, height: 840, orientation: "portrait" }),
+    false,
+    "An orientation-sized width change must remain a normal responsive layout update"
+);
+assert.equal(
+    isKeyboardOverlayResize({ left: 0, top: 0, width: 390, height: 780, orientation: "portrait" }, { left: 0, top: 0, width: 390, height: 840, orientation: "portrait" }),
+    false,
+    "Small browser-chrome viewport changes must remain normal responsive updates"
+);
 
 const savedLauncherPosition = getMinimizedPosition({ minimized: { x: 42, y: 84 } });
 assert.equal(savedLauncherPosition?.x, 42, "Saved launcher x-coordinate must be reusable");
