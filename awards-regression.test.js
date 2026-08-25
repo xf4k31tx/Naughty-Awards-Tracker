@@ -11,10 +11,10 @@ const source = fs.readFileSync(file, "utf8");
 const readme = fs.readFileSync(path.join(__dirname, "README.md"), "utf8");
 const instrumented = source.replace(
     /    detectRuntimeAtStartup\(\);[\s\S]*?\n\}\)\(\);\s*$/,
-    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, parseBackupPayload };\n})();\n"
+    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
-assert.match(source, /@version\s+1\.3\.11/, "Userscript metadata must reflect the native/persistence release");
+assert.match(source, /@version\s+1\.3\.12/, "Userscript metadata must reflect the minimized-launcher release");
 assert.match(source, /@license\s+MIT/, "metadata must declare the MIT license");
 assert.match(source, /https:\/\/github\.com\/SharpSplinter\/Naughty-Awards-Tracker/, "metadata must use the renamed GitHub account");
 assert.match(source, /https:\/\/raw\.githubusercontent\.com\/SharpSplinter\/Naughty-Awards-Tracker\/main/, "metadata must update from the renamed account");
@@ -34,6 +34,14 @@ assert.match(source, /#nat-safe-area-probe\{[^}]*padding:env\(safe-area-inset-to
 assert.match(source, /#nat-wrapper\{box-sizing:border-box;max-inline-size:var\(--nat-panel-max-width/, "The panel must cap its border box to the live viewport bounds");
 assert.match(source, /window\.visualViewport\?\.addEventListener\("scroll", refreshViewportLayout\)/, "Visual viewport movement must re-clamp the panel");
 assert.match(source, /if \(state\.isMinimized\) applyPosition\(\);\s*else applySize\(\);/, "Minimized panels must also remain inside live viewport bounds");
+assert.match(source, /function restoreMinimizedWidget\(\)/, "Minimized launchers must use one restore path");
+assert.match(source, /dashboard\.addEventListener\("pointerdown", \(event\) => \{\s*if \(!state\.isMinimized && !event\.target\.closest\("#nat-drag"\)\) return;/, "The entire minimized launcher must start a drag");
+assert.match(source, /const restoreAfterTap = event\?\.type === "pointerup" && state\.isMinimized && !moved;/, "A tap on the minimized launcher must restore it without confusing a drag for a tap");
+assert.match(source, /dragStartX = event\.clientX;\s*dragStartY = event\.clientY;/, "Launcher drag detection must track the initial pointer location");
+assert.match(source, /moved = moved \|\| Math\.abs\(event\.clientX - dragStartX\) > 2 \|\| Math\.abs\(event\.clientY - dragStartY\) > 2;/, "Slow launcher drags must not be mistaken for taps");
+assert.match(source, /dashboard\.addEventListener\("click", \(\) => \{\s*if \(!state\.isMinimized \|\| moved\) return;\s*restoreMinimizedWidget\(\);/, "Click fallback must restore from any part of the minimized launcher");
+assert.match(source, /minimized: \{ x: rect\.left, y: rect\.top \}/, "Dragging a minimized launcher must persist its exact coordinates");
+assert.match(source, /const minimizedPosition = state\.isMinimized \? getMinimizedPosition\(saved\) : null;/, "Saved minimized coordinates must be reapplied only for the launcher");
 assert.match(source, /@container \(max-width:430px\)\{[^}]*\.nat-refresh\{flex-wrap:wrap/, "Compact controls must reflow from the actual panel container width");
 assert.match(source, /@container \(max-width:430px\)[\s\S]*?\.nat-award-row\{grid-template-columns:4px minmax\(0,1fr\)/, "Compact award rows must remove their fixed trailing column");
 assert.match(source, /#nat-body\{overflow-x:clip;overflow-y:auto\}/, "The content region must never offer horizontal scrolling");
@@ -89,7 +97,7 @@ vm.runInNewContext(instrumented, sandbox, { filename: file });
 const {
     buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize,
     state, STORAGE, STORAGE_DELETE, createStorageAdapter, loadStoragePreference,
-    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, parseBackupPayload
+    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition
 } = sandbox.__natTest;
 
 const portraitBounds = panelBounds(
@@ -110,6 +118,13 @@ assert.equal(portraitSize.height, portraitBounds.height, "Oversized saved height
 const tinyBounds = panelBounds({ left: 0, top: 0, width: 20, height: 20 }, { left: 100, right: 100, top: 100, bottom: 100 }, 6);
 assert.equal(tinyBounds.width, 1, "Extreme insets must not create negative or horizontal-overflowing bounds");
 assert.equal(tinyBounds.height, 1, "Extreme insets must not create negative or vertically-overflowing bounds");
+
+const savedLauncherPosition = getMinimizedPosition({ minimized: { x: 42, y: 84 } });
+assert.equal(savedLauncherPosition?.x, 42, "Saved launcher x-coordinate must be reusable");
+assert.equal(savedLauncherPosition?.y, 84, "Saved launcher y-coordinate must be reusable");
+assert.equal(getMinimizedPosition({ minimized: { x: "not-a-coordinate", y: 84 } }), null, "Invalid launcher coordinates must be ignored");
+assert.equal(validateBackupPosition({ edge: "right", x: 10, y: 20, minimized: { x: 42, y: 84 } }), true, "Backups must preserve minimized launcher positions");
+assert.equal(validateBackupPosition({ edge: "right", x: 10, y: 20, minimized: { x: 42 } }), false, "Backups must reject incomplete minimized launcher positions");
 
 const summary = buildSummary([
     { id: "1", name: "First Steps", description: "First catalog award", rarity: "Common" },

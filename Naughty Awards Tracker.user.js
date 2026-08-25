@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
-// @version      1.3.11
+// @version      1.3.12
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       SharpSplinter [315311]
 // @license      MIT
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.11";
+    const VERSION = "1.3.12";
     const BASE_URL = "https://api.torn.com/v2/";
     const PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_";
     const NATIVE_REMINDER_ID = 6324;
@@ -1097,8 +1097,13 @@
         return hasExactBackupKeys(value.collectionViews, ["honors", "medals"]) && Object.values(value.collectionViews).every((view) => ["completed", "incomplete"].includes(view));
     }
     function validateBackupPosition(value) {
-        return value === null || (hasExactBackupKeys(value, ["edge", "x", "y"]) && ["left", "right", "top", "bottom"].includes(value.edge) &&
-            [value.x, value.y].every((number) => Number.isFinite(number) && Math.abs(number) <= 1000000));
+        if (value === null || !isBackupRecord(value)) return value === null;
+        const hasBasePosition = (hasExactBackupKeys(value, ["edge", "x", "y"]) || hasExactBackupKeys(value, ["edge", "x", "y", "minimized"])) &&
+            ["left", "right", "top", "bottom"].includes(value.edge) &&
+            [value.x, value.y].every((number) => Number.isFinite(number) && Math.abs(number) <= 1000000);
+        if (!hasBasePosition) return false;
+        return !Object.hasOwn(value, "minimized") || (hasExactBackupKeys(value.minimized, ["x", "y"]) &&
+            [value.minimized.x, value.minimized.y].every((number) => Number.isFinite(number) && Math.abs(number) <= 1000000));
     }
     function validateBackupPayload(payload) {
         if (!hasExactBackupKeys(payload, ["namespace", "schemaVersion", "createdAt", "data"]) || payload.namespace !== BACKUP_NAMESPACE || payload.schemaVersion !== BACKUP_SCHEMA_VERSION ||
@@ -1280,6 +1285,11 @@
         }
         return { width: 480, height: Math.min(720, Math.round(bounds.height * .8)) };
     }
+    function getMinimizedPosition(position) {
+        const location = position?.minimized;
+        if (!isBackupRecord(location) || !Number.isFinite(Number(location.x)) || !Number.isFinite(Number(location.y))) return null;
+        return { x: Number(location.x), y: Number(location.y) };
+    }
     function applyPosition(position = state.position) {
         const dashboard = state.dashboard;
         if (!dashboard) return;
@@ -1288,14 +1298,16 @@
         const rect = dashboard.getBoundingClientRect();
         const defaultTop = bounds.top + (state.runtime.isTornPDA && viewport.orientation === "portrait" ? 60 : 20);
         const saved = position || { edge: "right", x: bounds.right - rect.width, y: defaultTop };
+        const minimizedPosition = state.isMinimized ? getMinimizedPosition(saved) : null;
         const maxX = Math.max(bounds.left, bounds.right - rect.width);
         const maxY = Math.max(bounds.top, bounds.bottom - rect.height);
         const coordinate = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
-        const x = clamp(coordinate(saved.x, bounds.left), bounds.left, maxX);
-        const y = clamp(coordinate(saved.y, bounds.top), bounds.top, maxY);
+        const x = clamp(coordinate(minimizedPosition?.x ?? saved.x, bounds.left), bounds.left, maxX);
+        const y = clamp(coordinate(minimizedPosition?.y ?? saved.y, bounds.top), bounds.top, maxY);
         dashboard.style.right = "auto";
         dashboard.style.bottom = "auto";
-        dashboard.dataset.edge = saved.edge || "right";
+        dashboard.dataset.edge = minimizedPosition ? "free" : (saved.edge || "right");
+        if (minimizedPosition) { dashboard.style.left = x + "px"; dashboard.style.top = y + "px"; return; }
         if (saved.edge === "left") { dashboard.style.left = bounds.left + "px"; dashboard.style.top = y + "px"; }
         else if (saved.edge === "top") { dashboard.style.left = x + "px"; dashboard.style.top = bounds.top + "px"; }
         else if (saved.edge === "bottom") { dashboard.style.left = x + "px"; dashboard.style.top = maxY + "px"; }
@@ -1303,6 +1315,19 @@
     }
     function savePosition() {
         const rect = state.dashboard.getBoundingClientRect();
+        if (state.isMinimized) {
+            const previous = state.position && typeof state.position === "object" ? state.position : { edge: "right", x: rect.left, y: rect.top };
+            state.position = {
+                edge: ["left", "right", "top", "bottom"].includes(previous.edge) ? previous.edge : "right",
+                x: Number.isFinite(Number(previous.x)) ? Number(previous.x) : rect.left,
+                y: Number.isFinite(Number(previous.y)) ? Number(previous.y) : rect.top,
+                minimized: { x: rect.left, y: rect.top }
+            };
+            gmSet(STORAGE.position, state.position);
+            applyPosition();
+            return;
+        }
+        const minimizedPosition = getMinimizedPosition(state.position);
         const bounds = getPanelBounds();
         const distances = {
             left: rect.left - bounds.left, right: bounds.right - rect.right,
@@ -1310,6 +1335,7 @@
         };
         const edge = Object.entries(distances).sort((a, b) => a[1] - b[1])[0][0];
         state.position = { edge, x: rect.left, y: rect.top };
+        if (minimizedPosition) state.position.minimized = minimizedPosition;
         gmSet(STORAGE.position, state.position);
         applyPosition();
     }
@@ -1520,20 +1546,30 @@
     function scheduleDailyRefresh() {
         armDailyRefresh(nextDailyRefreshAt());
     }
+    function restoreMinimizedWidget() {
+        if (!state.isMinimized) return false;
+        state.isMinimized = false;
+        saveDashboardState();
+        applyWidgetView();
+        render();
+        return true;
+    }
     function bindWindowControls() {
         const dashboard = state.dashboard;
-        const drag = dashboard.querySelector("#nat-drag");
-        let dragging = false, moved = false, dragPointerId = null, offsetX = 0, offsetY = 0;
+        let dragging = false, moved = false, dragPointerId = null, offsetX = 0, offsetY = 0, dragStartX = 0, dragStartY = 0;
         const isPrimaryPointer = (event) => event.isPrimary && (event.pointerType !== "mouse" || event.button === 0);
-        drag.addEventListener("pointerdown", (event) => {
+        dashboard.addEventListener("pointerdown", (event) => {
+            if (!state.isMinimized && !event.target.closest("#nat-drag")) return;
             if (!isPrimaryPointer(event) || event.target.closest("#nat-minimize")) return;
             const rect = dashboard.getBoundingClientRect();
             dragging = true;
             moved = false;
             dragPointerId = event.pointerId;
+            dragStartX = event.clientX;
+            dragStartY = event.clientY;
             offsetX = event.clientX - rect.left;
             offsetY = event.clientY - rect.top;
-            drag.setPointerCapture?.(event.pointerId);
+            dashboard.setPointerCapture?.(event.pointerId);
             event.preventDefault();
         });
         document.addEventListener("pointermove", (event) => {
@@ -1542,24 +1578,23 @@
             const rect = dashboard.getBoundingClientRect();
             const left = clamp(event.clientX - offsetX, bounds.left, Math.max(bounds.left, bounds.right - rect.width));
             const top = clamp(event.clientY - offsetY, bounds.top, Math.max(bounds.top, bounds.bottom - rect.height));
-            moved = moved || Math.abs(left - rect.left) > 2 || Math.abs(top - rect.top) > 2;
+            moved = moved || Math.abs(event.clientX - dragStartX) > 2 || Math.abs(event.clientY - dragStartY) > 2;
             dashboard.style.left = left + "px";
             dashboard.style.top = top + "px";
         });
         const finishDragging = (event) => {
             if (!dragging || (event && event.pointerId !== dragPointerId)) return;
+            const restoreAfterTap = event?.type === "pointerup" && state.isMinimized && !moved;
             if (dragging) savePosition();
             dragging = false;
             dragPointerId = null;
+            if (restoreAfterTap) restoreMinimizedWidget();
         };
         document.addEventListener("pointerup", finishDragging);
         document.addEventListener("pointercancel", finishDragging);
-        drag.addEventListener("click", () => {
+        dashboard.addEventListener("click", () => {
             if (!state.isMinimized || moved) return;
-            state.isMinimized = false;
-            saveDashboardState();
-            applyWidgetView();
-            render();
+            restoreMinimizedWidget();
         });
         dashboard.querySelector("#nat-minimize").addEventListener("click", (event) => {
             event.stopPropagation();
