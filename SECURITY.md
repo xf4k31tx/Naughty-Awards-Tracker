@@ -2,7 +2,10 @@
 
 ## Supported versions
 
-Security fixes are provided for the current release on the `main` branch. Older installed userscript versions should be updated before reporting a problem unless updating would prevent reproduction.
+| Version | Supported |
+| --- | --- |
+| Latest release on `main` | :white_check_mark: |
+| Earlier versions | :x: |
 
 ## Reporting a vulnerability
 
