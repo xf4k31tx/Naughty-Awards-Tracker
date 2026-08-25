@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
-// @version      1.3.10
+// @version      1.3.11
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       SharpSplinter [315311]
+// @license      MIT
 // @match        https://www.torn.com/page.php?sid=awards*
 // @source       https://raw.githubusercontent.com/SharpSplinter/Naughty-Awards-Tracker/main/Naughty%20Awards%20Tracker.user.js
 // @updateURL    https://raw.githubusercontent.com/SharpSplinter/Naughty-Awards-Tracker/main/Naughty%20Awards%20Tracker.user.js
@@ -22,7 +23,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.10";
+    const VERSION = "1.3.11";
     const BASE_URL = "https://api.torn.com/v2/";
     const PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_";
     const NATIVE_REMINDER_ID = 6324;
