@@ -14,7 +14,7 @@ const instrumented = source.replace(
     "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
-assert.match(source, /@version\s+1\.3\.13/, "Userscript metadata must reflect the keyboard-overlay release");
+assert.match(source, /@version\s+1\.3\.14/, "Userscript metadata must reflect the shared-standard release");
 assert.match(source, /@license\s+MIT/, "metadata must declare the MIT license");
 assert.match(source, /https:\/\/github\.com\/SharpSplinter\/Naughty-Awards-Tracker/, "metadata must use the renamed GitHub account");
 assert.match(source, /https:\/\/raw\.githubusercontent\.com\/SharpSplinter\/Naughty-Awards-Tracker\/main/, "metadata must update from the renamed account");
@@ -54,6 +54,7 @@ assert.match(source, /@container \(max-width:430px\)[\s\S]*?\.nat-award-row\{gri
 assert.match(source, /#nat-body\{overflow-x:clip;overflow-y:auto\}/, "The content region must never offer horizontal scrolling");
 assert.match(readme, /safe-area-adjusted bounds/, "README must document the responsive panel clamp");
 assert.match(source, /<span>Screen Size<\/span><strong data-screen-size>/, "Settings must show the live screen size");
+assert.match(source, /<span>Layout Profile<\/span><strong data-layout-profile>/, "Settings must show the measured layout profile");
 assert.match(source, /<span>Storage Method<\/span><strong data-storage-method>/, "Settings must show the active storage method");
 assert.match(source, /data-action='toggle-legacy-storage'/, "Settings must expose the legacy GM storage switch");
 assert.match(source, /async function setUseLegacyGMStorage\(enabled\)/, "Legacy storage selection must perform a real storage migration");
@@ -65,6 +66,11 @@ assert.match(source, /PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_"/, "TornPDA's i
 assert.match(source, /escapeHtml\(usingInjectedKey \? "" : state\.savedApiKey\)/, "An injected key must never be placed into the settings input");
 assert.match(source, /\[STORAGE\.key\]: state\.savedApiKey \? state\.savedApiKey : STORAGE_DELETE/, "An injected key must never be persisted by the tracker");
 assert.match(source, /nativeBridgeCall\("showToast"/, "TornPDA feedback must use the native toast handler");
+assert.match(source, /function awardsFreshness\(\)/, "Each tab must report source-aware data freshness");
+assert.match(source, /Awards data · " \+ freshness\.source/, "Status rows must identify their data source");
+assert.match(source, /Refresh awards/, "Refresh controls must state their purpose");
+assert.match(source, /function standardFeedbackLayer\(\)/, "Desktop feedback must have a stacked-toast layer");
+assert.match(source, /toast\.remove\(\);\s*state\.toastTimers\.delete\(timer\);/, "Stacked toasts must clean up independently");
 assert.match(source, /nativeBridgeCall\("scheduleNotification"/, "TornPDA reminders must use the native notification handler");
 assert.match(source, /document\.addEventListener\("visibilitychange"/, "Automatic refresh must track document visibility");
 assert.match(readme, /Use legacy GM storage/, "README must document the storage preference");

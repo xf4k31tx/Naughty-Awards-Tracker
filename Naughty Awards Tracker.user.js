@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
-// @version      1.3.13
+// @version      1.3.14
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       SharpSplinter [315311]
 // @license      MIT
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "1.3.13";
+    const VERSION = "1.3.14";
     const BASE_URL = "https://api.torn.com/v2/";
     const PDA_INJECTED_API_KEY = "_###PDA-APIKEY###_";
     const NATIVE_REMINDER_ID = 6324;
@@ -67,7 +67,7 @@
         apiKey: "", savedApiKey: "", apiKeySource: "saved", activeTab: "awards", theme: "dark", isMinimized: false,
         windowSizes: {}, position: null, cache: null, refreshedAt: 0,
         dashboard: null, refreshInFlight: false, dailyTimer: null, dailyRefreshDueAt: 0, autoRefreshQueued: false, refreshPaused: false,
-        reminderTimer: null, toastTimer: null, activityBound: false, nativeTabActive: true, nativeTabVisible: true,
+        reminderTimer: null, toastTimers: new Set(), activityBound: false, nativeTabActive: true, nativeTabVisible: true,
         backupIncludeApiKey: false, pendingBackup: null, restoreInFlight: false, backupExportInFlight: false, error: "", useLegacyGMStorage: false,
         searchQueries: { honors: "", medals: "" }, collectionViews: { honors: "completed", medals: "completed" }, searchSaveTimer: null,
         runtime: {
@@ -289,18 +289,41 @@
             textColor: { a: 255, r: 255, g: 255, b: 255 }
         }).catch((error) => logDebug("Native toast unavailable", { category: nativeErrorCategory(error) }));
     }
+    function standardFeedbackLayer() {
+        const dashboard = state.dashboard;
+        if (!dashboard) return null;
+        if (!dashboard.querySelector("#nat-standard-feedback-style")) {
+            const style = document.createElement("style");
+            style.id = "nat-standard-feedback-style";
+            style.textContent = "#nat-wrapper .nat-tab-status{display:flex;align-items:center;flex-wrap:wrap;gap:5px 8px;min-width:0;padding:8px 9px;border:1px solid #3c587b;border-radius:8px;background:rgba(14,32,54,.62);color:#aac1dc;font-size:10px;line-height:1.35}#nat-wrapper .nat-tab-status strong{color:#9de3aa;font-size:10px}#nat-wrapper .nat-tab-status time{min-width:0;color:#9baec6;overflow-wrap:anywhere}#nat-wrapper .nat-tab-status[data-state='partial'] strong{color:#ffd276}#nat-wrapper .nat-tab-status[data-state='stale'] strong,#nat-wrapper .nat-tab-status[data-state='not-updated'] strong{color:#ff9ca8}#nat-wrapper #nat-toast-stack{position:absolute;z-index:12;right:10px;bottom:10px;display:grid;gap:7px;width:min(340px,calc(100% - 20px));pointer-events:none}#nat-wrapper .nat-toast{padding:9px 11px;border:1px solid #4a668d;border-radius:8px;background:rgba(20,41,68,.97);color:#f7fbff;font-size:11px;font-weight:700;line-height:1.35;box-shadow:0 8px 20px rgba(0,0,0,.34)}#nat-wrapper .nat-toast[data-tone='green']{border-color:#3d8b64;background:rgba(25,85,61,.97)}#nat-wrapper .nat-toast[data-tone='red']{border-color:#a34b55;background:rgba(120,42,50,.97)}#nat-wrapper[data-theme='light'] .nat-tab-status{border-color:#9eb2c9;background:#e7eff8;color:#465c76}#nat-wrapper[data-theme='light'] .nat-tab-status time{color:#506783}#nat-wrapper[data-theme='light'] .nat-toast{border-color:#8097b4;background:#e6eef7;color:#142238}";
+            dashboard.append(style);
+        }
+        let stack = dashboard.querySelector("#nat-toast-stack");
+        if (!stack) {
+            stack = document.createElement("div");
+            stack.id = "nat-toast-stack";
+            stack.setAttribute("aria-live", "polite");
+            stack.setAttribute("aria-relevant", "additions");
+            dashboard.append(stack);
+        }
+        return stack;
+    }
     function showToast(text, tone = "blue") {
         const message = String(text || "").trim();
         if (!message) return;
-        const toast = state.dashboard?.querySelector("#nat-toast");
-        if (toast) {
-            toast.textContent = message;
+        const stack = standardFeedbackLayer();
+        if (stack) {
+            const toast = document.createElement("div");
+            toast.className = "nat-toast";
             toast.dataset.tone = tone;
-            toast.hidden = false;
-            clearTimeout(state.toastTimer);
-            state.toastTimer = window.setTimeout(() => {
-                if (toast.textContent === message) toast.hidden = true;
+            toast.setAttribute("role", "status");
+            toast.textContent = message;
+            stack.append(toast);
+            const timer = window.setTimeout(() => {
+                toast.remove();
+                state.toastTimers.delete(timer);
             }, 4200);
+            state.toastTimers.add(timer);
         }
         nativeToast(message, tone);
     }
@@ -367,8 +390,10 @@
         if (!dashboard) return;
         const viewport = getPanelViewportMetrics();
         const bounds = getPanelBounds();
+        const profile = layoutProfile();
         dashboard.dataset.runtime = state.runtime.isTornPDA ? "tornpda" : "desktop";
         dashboard.dataset.orientation = viewport.orientation;
+        dashboard.dataset.layoutProfile = profile;
         dashboard.dataset.compact = state.runtime.isTornPDA && (bounds.width < 480 || bounds.height < 520) ? "true" : "false";
         dashboard.dataset.keyboardOverlay = state.runtime.isTornPDA && keyboardState().active ? "true" : "false";
         dashboard.style.setProperty("--nat-viewport-width", viewport.width + "px");
@@ -378,11 +403,13 @@
         const label = dashboard.querySelector("[data-runtime-label]");
         const detail = dashboard.querySelector("[data-runtime-detail]");
         const screen = dashboard.querySelector("[data-screen-size]");
+        const layout = dashboard.querySelector("[data-layout-profile]");
         const storage = dashboard.querySelector("[data-storage-method]");
         const storageDetail = dashboard.querySelector("[data-storage-detail]");
         if (label) label.textContent = runtimeLabel();
         if (detail) detail.textContent = runtimeDescription();
         if (screen) screen.textContent = screenSizeLabel();
+        if (layout) layout.textContent = profile;
         if (storage) storage.textContent = storageMethodLabel();
         if (storageDetail) storageDetail.textContent = storageMethodDescription();
     }
@@ -442,6 +469,32 @@
         if (elapsed < 86400000) return Math.floor(elapsed / 3600000) + "h ago";
         return Math.floor(elapsed / 86400000) + "d ago";
     };
+    const formatUtcTimestamp = (value) => {
+        const timestamp = Number(value || 0);
+        return timestamp ? new Date(timestamp).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC") : "—";
+    };
+    function layoutProfile() {
+        const viewport = getPanelViewportMetrics();
+        const bounds = getPanelBounds();
+        const panelWidth = Number(state.dashboard?.getBoundingClientRect?.().width || 0);
+        const width = Math.max(1, Math.round(panelWidth || bounds.width || viewport.width));
+        if (width <= 360 || viewport.height <= 480) return "narrow";
+        if (width <= 520 || viewport.height <= 580) return "compact";
+        if (width <= 920) return "standard";
+        return "wide";
+    }
+    function awardsFreshness() {
+        const refreshedAt = Number(state.refreshedAt || 0);
+        if (!refreshedAt) return { state: "Not updated", source: "Torn API", timestamp: "—", relative: "Never" };
+        const age = Math.max(0, Date.now() - refreshedAt);
+        const stateLabel = state.error && state.cache ? "Partial" : age > 36 * 60 * 60 * 1000 ? "Stale" : "Fresh";
+        return { state: stateLabel, source: "Torn API", timestamp: formatUtcTimestamp(refreshedAt), relative: formatRelative(refreshedAt) };
+    }
+    function awardsStatusRow() {
+        const freshness = awardsFreshness();
+        const dateTime = state.refreshedAt ? new Date(state.refreshedAt).toISOString() : "";
+        return "<div class='nat-tab-status' data-state='" + freshness.state.toLowerCase().replace(/\s+/g, "-") + "'><strong>" + freshness.state + "</strong><span>Awards data · " + freshness.source + "</span><time datetime='" + dateTime + "'>" + freshness.timestamp + " · " + freshness.relative + "</time></div>";
+    }
     const clamp = (number, min, max) => Math.min(Math.max(number, min), Math.max(min, max));
     function panelBounds(viewport, safeArea = {}, gutter = 0) {
         const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -1144,6 +1197,7 @@
         const usingInjectedKey = state.apiKeySource === "tornpda";
         const backupKeyChecked = state.backupIncludeApiKey ? " checked" : "";
         const backupPending = state.pendingBackup;
+        const profile = layoutProfile();
         const backupConfirmation = backupPending ? "<div class='nat-backup-confirm' role='status'><strong>Restore " + escapeHtml(backupPending.filename) + "?</strong><p>This replaces the tracker cache, layout, and preferences" + (backupPending.payload.data.includesApiKey ? ", including its saved manual API key." : ". Your current saved API key stays unchanged.") + "</p><div class='nat-settings-actions'><button data-action='confirm-backup-restore'" + (state.restoreInFlight ? " disabled" : "") + ">" + (state.restoreInFlight ? "Restoring…" : "Restore Backup Now") + "</button><button class='nat-ghost-button' data-action='cancel-backup-restore'" + (state.restoreInFlight ? " disabled" : "") + ">Cancel</button></div></div>" : "";
         return "<section class='nat-card nat-settings'><div class='nat-card-header'><div><span class='nat-eyebrow'>Tracker preferences</span><h2>Settings</h2></div><button class='nat-ghost-button' data-tab='awards'>Awards</button></div><label for='nat-api-key'>Torn API Key</label>" +
             "<div class='nat-key-row'><input id='nat-api-key' type='password' autocomplete='off' value='" + escapeHtml(usingInjectedKey ? "" : state.savedApiKey) +
@@ -1152,6 +1206,7 @@
             "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:00 UTC</strong><p>Automatic refresh pauses while the tab is inactive and resumes safely when it returns.</p></div>" +
             "<div class='nat-setting-note nat-runtime-note'><span>Runtime</span><strong data-runtime-label>" + runtimeLabel() + "</strong><p data-runtime-detail>" + runtimeDescription() + "</p></div>" +
             "<div class='nat-setting-note'><span>Screen Size</span><strong data-screen-size>" + screenSizeLabel() + "</strong><p>Live layout viewport; it stays stable while the native keyboard is open.</p></div>" +
+            "<div class='nat-setting-note'><span>Layout Profile</span><strong data-layout-profile>" + profile + "</strong><p>Measured from the available panel, viewport, zoom, and orientation.</p></div>" +
             "<div class='nat-setting-note'><span>Storage Method</span><strong data-storage-method>" + storageMethodLabel() + "</strong><p data-storage-detail>" + storageMethodDescription() + "</p></div>" +
             "<label class='nat-storage-toggle' for='nat-use-legacy-gm-storage'><input id='nat-use-legacy-gm-storage' type='checkbox' data-action='toggle-legacy-storage'" + legacyChecked + "><span><strong>Use legacy GM storage</strong><small>Moves current tracker data before switching the primary store.</small></span></label>" +
             "<div class='nat-setting-note nat-backup-note'><span>Backup &amp; Restore</span><strong>Local tracker data</strong><p>Downloads your cache, layout, and preferences. TornPDA injected keys are never included.</p></div>" +
@@ -1508,10 +1563,11 @@
         const tabs = [["awards", "Awards"], ["honors", "Honors"], ["medals", "Medals"]].map(([id, label]) =>
             "<button class='nat-tab " + (state.activeTab === id ? "active" : "") + "' data-tab='" + id + "'>" + label + "</button>"
         ).join("");
-        content.innerHTML = state.activeTab === "settings" ? settingsView() :
-            "<div class='nat-refresh'><div class='nat-sync-status'><span class='nat-sync-dot " + (state.refreshInFlight ? "is-refreshing" : "") + "'></span><span>Updated <strong>" + (state.refreshedAt ? formatRelative(state.refreshedAt) : "Never") +
-            "</strong></span><small>" + (state.refreshPaused ? "Refresh paused while inactive" : "Daily at 00:00 UTC") + "</small></div><div class='nat-top-actions'><button class='nat-refresh-button' data-action='refresh' " + (state.refreshInFlight || !state.apiKey ? "disabled" : "") +
-            ">↻ " + (state.refreshInFlight ? "Refreshing…" : "Refresh") + "</button><button class='nat-icon-button' data-tab='settings' title='Settings' aria-label='Settings'>⚙</button></div></div><nav class='nat-tabs' aria-label='Awards views'>" + tabs + "</nav>" +
+        const statusRow = awardsStatusRow();
+        content.innerHTML = state.activeTab === "settings" ? statusRow + settingsView() :
+            statusRow + "<div class='nat-refresh'><div class='nat-sync-status'><span class='nat-sync-dot " + (state.refreshInFlight ? "is-refreshing" : "") + "'></span><span>" + (state.refreshInFlight ? "Refreshing awards from Torn API" : state.refreshPaused ? "Refresh paused while inactive" : "Daily at 00:00 UTC") +
+            "</span></div><div class='nat-top-actions'><button class='nat-refresh-button' data-action='refresh' " + (state.refreshInFlight || !state.apiKey ? "disabled" : "") +
+            ">↻ " + (state.refreshInFlight ? "Refreshing awards…" : "Refresh awards") + "</button><button class='nat-icon-button' data-tab='settings' title='Settings' aria-label='Settings'>⚙</button></div></div><nav class='nat-tabs' aria-label='Awards views'>" + tabs + "</nav>" +
             (state.error ? "<div class='nat-error'>" + escapeHtml(state.error) + "</div>" : "") + awardsView();
         dashboard.querySelectorAll("[data-tab]").forEach((button) => button.onclick = () => {
             state.activeTab = button.dataset.tab;
@@ -1833,6 +1889,7 @@
             "</style><header id='nat-drag'><span id='nat-title'></span><button id='nat-minimize' aria-label='Minimize Naughty Awards Tracker'>−</button></header><main id='nat-body' tabindex='0' aria-label='Awards Tracker content'><div id='nat-content'></div></main><i id='nat-safe-area-probe' aria-hidden='true'></i><span id='nat-toast' role='status' aria-live='polite' hidden></span><span id='nat-resize-status' class='nat-sr-only' aria-live='polite'></span><button type='button' class='nat-resize' data-corner='top-left' title='Resize from the upper-left corner' aria-label='Resize window from the upper-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-left' title='Resize from the bottom-left corner' aria-label='Resize window from the bottom-left corner. Use arrow keys; hold Shift for larger changes.'></button><button type='button' class='nat-resize' data-corner='bottom-right' title='Resize from the bottom-right corner' aria-label='Resize window from the bottom-right corner. Use arrow keys; hold Shift for larger changes.'></button>";
         document.body.appendChild(dashboard);
         state.dashboard = dashboard;
+        standardFeedbackLayer();
         updateRuntimeLayout();
         bindWindowControls();
         applyWidgetView();
