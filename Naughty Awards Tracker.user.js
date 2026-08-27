@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
-// @version      1.3.17
+// @version      1.3.19
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       SharpSplinter [315311]
 // @license      MIT
@@ -31,6 +31,7 @@
     const BACKUP_NAMESPACE = "naughty-awards-tracker.backup";
     const BACKUP_SCHEMA_VERSION = 1;
     const BACKUP_MAX_BYTES = 8 * 1024 * 1024;
+    const DAILY_REFRESH_UTC_MINUTES = 4;
     const KEYBOARD_OVERLAY_MIN_HEIGHT_LOSS = 96;
     const KEYBOARD_OVERLAY_MIN_HEIGHT_RATIO = .18;
     const STORAGE = {
@@ -330,7 +331,21 @@
     }
     function nextDailyRefreshAt(now = Date.now()) {
         const date = new Date(now);
-        return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1) + 250;
+        const today = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, DAILY_REFRESH_UTC_MINUTES, 0, 250);
+        return now < today ? today : Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, 0, DAILY_REFRESH_UTC_MINUTES, 0, 250);
+    }
+    function dailyRefreshPeriodKey(timestamp = 0) {
+        const value = Number(timestamp || 0);
+        if (!Number.isFinite(value) || value <= 0) return "";
+        const date = new Date(value - DAILY_REFRESH_UTC_MINUTES * 60 * 1000);
+        return Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) : "";
+    }
+    function hasAwardsSnapshotForRefreshPeriod(now = Date.now()) {
+        const period = dailyRefreshPeriodKey(now);
+        return Boolean(period) && dailyRefreshPeriodKey(state.refreshedAt) === period;
+    }
+    function needsDailyAwardsRefresh(now = Date.now()) {
+        return !hasAwardsSnapshotForRefreshPeriod(now);
     }
     function scheduleDesktopReminder(timestamp) {
         clearTimeout(state.reminderTimer);
@@ -436,7 +451,10 @@
             updateRuntimeLayout();
             if (state.dashboard) state.isMinimized ? applyPosition() : applySize();
             if (state.runtime.isTornPDA) void refreshNativeTabState();
-            if (adoptedInjectedKey && state.dashboard) render();
+            if (adoptedInjectedKey && state.dashboard) {
+                render();
+                queueMissedDailyRefresh("injected-key");
+            }
             logInfo("Runtime confirmed", {
                 runtime: state.runtime.isTornPDA ? "TornPDA" : "desktop",
                 bridge: isTornPdaBridgeAvailable(),
@@ -998,9 +1016,10 @@
         if (!isTrackerActive()) return;
         const dueAt = Number(state.dailyRefreshDueAt || 0);
         state.refreshPaused = false;
-        if (state.autoRefreshQueued || (dueAt && Date.now() >= dueAt)) {
+        if (state.autoRefreshQueued || needsDailyAwardsRefresh() || (dueAt && Date.now() >= dueAt)) {
             state.autoRefreshQueued = false;
-            if (!state.isMinimized) void refreshAwards({ automatic: true }).finally(scheduleDailyRefresh);
+            if (queueMissedDailyRefresh("tab-resumed")) return;
+            if (!state.isMinimized && dueAt && Date.now() >= dueAt) void refreshAwards({ automatic: true }).finally(scheduleDailyRefresh);
             else scheduleDailyRefresh();
             return;
         }
@@ -1080,6 +1099,23 @@
             render();
         }
         return !state.error;
+    }
+    function queueMissedDailyRefresh(reason = "stale-snapshot") {
+        if (!needsDailyAwardsRefresh() || state.refreshInFlight) return false;
+        if (!state.apiKey || state.isMinimized) {
+            logDebug("Daily awards catch-up deferred", { reason, hasApiKey: Boolean(state.apiKey), minimized: state.isMinimized });
+            return false;
+        }
+        if (!isTrackerActive()) {
+            state.autoRefreshQueued = true;
+            state.refreshPaused = true;
+            logDebug("Daily awards catch-up paused", { reason: "inactive-tab" });
+            return false;
+        }
+        state.autoRefreshQueued = false;
+        logInfo("Daily awards catch-up started", { reason, refreshedAt: state.refreshedAt || 0 });
+        void refreshAwards({ automatic: true }).finally(scheduleDailyRefresh);
+        return true;
     }
 
     function rarityChips(summary) {
@@ -1204,7 +1240,7 @@
             "<div class='nat-key-row'><input id='nat-api-key' type='password' autocomplete='off' value='" + escapeHtml(usingInjectedKey ? "" : state.savedApiKey) +
             "' placeholder='" + (usingInjectedKey ? "Using TornPDA injected API key" : "Enter Torn API key") + "'><button data-action='save-key'>Save Key</button></div>" +
             (usingInjectedKey ? "<p class='nat-key-source'>A TornPDA injected API key is active and is never shown or stored by this tracker.</p>" : "") +
-            "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:00 UTC</strong><p>Automatic refresh pauses while the tab is inactive and resumes safely when it returns.</p></div>" +
+            "<div class='nat-setting-note'><span>Refresh schedule</span><strong>Daily at 00:04 UTC</strong><p>Automatic refresh pauses while the tab is inactive and resumes safely when it returns.</p></div>" +
             "<div class='nat-setting-note nat-runtime-note'><span>Runtime</span><strong data-runtime-label>" + runtimeLabel() + "</strong><p data-runtime-detail>" + runtimeDescription() + "</p></div>" +
             "<div class='nat-setting-note'><span>Screen Size</span><strong data-screen-size>" + screenSizeLabel() + "</strong><p>Live layout viewport; it stays stable while the native keyboard is open.</p></div>" +
             "<div class='nat-setting-note'><span>Layout Profile</span><strong data-layout-profile>" + profile + "</strong><p>Measured from the available panel, viewport, zoom, and orientation.</p></div>" +
@@ -1529,9 +1565,6 @@
         const content = state.dashboard?.querySelector("#nat-content");
         if (!body || !content || state.isMinimized) return;
         body.style.setProperty("--nat-scale", "1");
-        if (state.runtime.isTornPDA) return;
-        const scale = Math.max(.72, Math.min(1, Math.max(1, body.clientHeight - 4) / Math.max(1, content.scrollHeight)));
-        body.style.setProperty("--nat-scale", String(scale));
     }
     function applyWidgetView() {
         const dashboard = state.dashboard;
@@ -1566,7 +1599,7 @@
         ).join("");
         const statusRow = awardsStatusRow();
         content.innerHTML = state.activeTab === "settings" ? statusRow + settingsView() :
-            statusRow + "<div class='nat-refresh'><div class='nat-sync-status'><span class='nat-sync-dot " + (state.refreshInFlight ? "is-refreshing" : "") + "'></span><span>" + (state.refreshInFlight ? "Refreshing awards from Torn API" : state.refreshPaused ? "Refresh paused while inactive" : "Daily at 00:00 UTC") +
+            statusRow + "<div class='nat-refresh'><div class='nat-sync-status'><span class='nat-sync-dot " + (state.refreshInFlight ? "is-refreshing" : "") + "'></span><span>" + (state.refreshInFlight ? "Refreshing awards from Torn API" : state.refreshPaused ? "Refresh paused while inactive" : "Daily at 00:04 UTC") +
             "</span></div><div class='nat-top-actions'><button class='nat-refresh-button' data-action='refresh' " + (state.refreshInFlight || !state.apiKey ? "disabled" : "") +
             ">↻ " + (state.refreshInFlight ? "Refreshing awards…" : "Refresh awards") + "</button><button class='nat-icon-button' data-tab='settings' title='Settings' aria-label='Settings'>⚙</button></div></div><nav class='nat-tabs' aria-label='Awards views'>" + tabs + "</nav>" +
             (state.error ? "<div class='nat-error'>" + escapeHtml(state.error) + "</div>" : "") + awardsView();
@@ -1598,7 +1631,7 @@
             state.error = "";
             if (state.savedApiKey) gmSet(STORAGE.key, state.savedApiKey);
             else gmDelete(STORAGE.key);
-            if (state.apiKey && !state.cache) void refreshAwards();
+            if (state.apiKey && (!state.cache || needsDailyAwardsRefresh())) queueMissedDailyRefresh("api-key-saved");
             showToast(state.apiKeySource === "tornpda" ? "TornPDA injected API key is active." : (state.apiKey ? "API key saved." : "API key cleared."), "green");
             render();
         });
@@ -1720,6 +1753,7 @@
         saveDashboardState();
         applyWidgetView();
         render();
+        queueMissedDailyRefresh("restored");
         return true;
     }
     function bindWindowControls() {
@@ -1862,7 +1896,7 @@
             "#nat-wrapper[data-theme='light']{background:#f8fafc;color:#172033;border-color:#cbd5e1}#nat-wrapper *,#nat-wrapper *:before,#nat-wrapper *:after{box-sizing:border-box;min-width:0;max-width:100%;overflow-wrap:anywhere}" +
             "#nat-drag{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;background:#2c2c2c;border-bottom:1px solid #444;cursor:move;user-select:none}#nat-wrapper[data-theme='light'] #nat-drag{background:#e2e8f0;border-color:#cbd5e1}" +
             "#nat-title{font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#nat-minimize{width:36px;height:30px;flex:0 0 36px;place-items:center;border:1px solid #666;border-radius:5px;color:#fff;background:#444;font-size:19px;font-weight:700;cursor:pointer}" +
-            "#nat-body{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch;padding:10px;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}#nat-body::-webkit-scrollbar,.nat-list::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;background:transparent!important}#nat-body::-webkit-scrollbar-track,#nat-body::-webkit-scrollbar-thumb,#nat-body::-webkit-scrollbar-corner,.nat-list::-webkit-scrollbar-track,.nat-list::-webkit-scrollbar-thumb,.nat-list::-webkit-scrollbar-corner{background:transparent!important;border:0!important}#nat-content{display:grid;gap:8px;align-items:stretch;transform:scale(var(--nat-scale,1));transform-origin:top left;width:calc(100% / var(--nat-scale,1))}" +
+            "#nat-body{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch;padding:10px;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}#nat-body::-webkit-scrollbar,.nat-list::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;background:transparent!important}#nat-body::-webkit-scrollbar-track,#nat-body::-webkit-scrollbar-thumb,#nat-body::-webkit-scrollbar-corner,.nat-list::-webkit-scrollbar-track,.nat-list::-webkit-scrollbar-thumb,.nat-list::-webkit-scrollbar-corner{background:transparent!important;border:0!important}#nat-content{display:grid;gap:8px;align-items:stretch;width:100%}" +
             ".nat-refresh{display:flex;justify-content:space-between;align-items:center;gap:8px;color:#aab4c4;font-size:10px}.nat-tabs{display:flex;gap:5px;flex-wrap:wrap}#nat-wrapper button{border:1px solid #4b5563;border-radius:4px;background:#2a2a2a;color:#fff;padding:6px 8px;font-size:11px;cursor:pointer}#nat-wrapper button:hover{filter:brightness(1.18)}#nat-wrapper button:disabled{opacity:.55;cursor:not-allowed}#nat-wrapper[data-theme='light'] button{background:#e2e8f0;color:#172033;border-color:#94a3b8}.nat-tab.active{background:#3b5998!important;color:#fff!important;font-weight:700}" +
             ".nat-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;align-items:stretch;width:100%}.nat-card{width:100%;border:1px solid #2a2a2a;border-radius:8px;padding:10px;background:rgba(20,20,20,.7)}#nat-wrapper[data-theme='light'] .nat-card{background:#fff;border-color:#cbd5e1}.nat-card-header,.nat-progress-header{display:flex;justify-content:space-between;gap:8px;align-items:start}#nat-wrapper h2{margin:0 0 6px;font-size:13px}.nat-card-header strong,.nat-progress-header strong{color:#9dd8ff;font-size:11px;white-space:nowrap}.nat-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px}.nat-chip{border:1px solid #3b3b3b;border-radius:4px;padding:2px 5px;font-size:10px}" +
             ".nat-award-row,.nat-progress-row{border-top:1px solid #2b2b2b;padding:7px 0}#nat-wrapper[data-theme='light'] .nat-award-row,#nat-wrapper[data-theme='light'] .nat-progress-row{border-color:#e2e8f0}.nat-award-row{display:flex;justify-content:space-between;gap:8px}.nat-award-copy{flex:1}.nat-award-row time,.nat-progress-value,.nat-description,.nat-empty,.nat-settings p{color:#9ca3af;font-size:10px;line-height:1.35}.nat-award-row time{white-space:nowrap}.nat-award-name{font-size:11px;font-weight:700}.nat-description{margin-top:2px}.nat-progress-track{height:6px;margin-top:6px;overflow:hidden;border-radius:3px;background:#222}.nat-progress-track>div{height:100%;background:#7fe18d}.nat-progress-value{margin-top:3px}.nat-list{width:100%;max-height:none;overflow:visible;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}.nat-settings{display:grid;gap:8px}.nat-settings label{font-size:11px;font-weight:700}.nat-key-row{display:flex;gap:6px}.nat-key-row input{flex:1;min-width:0;border:1px solid #64748b;border-radius:4px;background:#111;color:#fff;padding:6px}#nat-wrapper[data-theme='light'] .nat-key-row input{background:#fff;color:#172033}.nat-error{padding:7px;border:1px solid #a33;border-radius:5px;color:#ff9b9b;background:rgba(160,30,30,.18);font-size:11px}" +
@@ -1870,7 +1904,7 @@
             "</style><style>" +
             "#nat-wrapper{container-type:inline-size;background:linear-gradient(155deg,rgba(17,25,38,.99),rgba(11,16,25,.99));color:#edf4ff;border-color:#34445e;border-radius:12px;box-shadow:0 14px 36px rgba(0,0,0,.55);font-family:Inter,Segoe UI,Arial,sans-serif}#nat-wrapper[data-theme='light']{background:linear-gradient(155deg,#f8fbff,#edf3fa);color:#172033;border-color:#bfd0e3;box-shadow:0 14px 32px rgba(30,48,72,.18)}" +
             "#nat-drag{min-height:48px;padding:9px 11px;background:linear-gradient(90deg,#182337,#243a5a);border-color:#435b7d}#nat-wrapper[data-theme='light'] #nat-drag{background:linear-gradient(90deg,#e8f0fa,#dce9f7);border-color:#bfd0e3}#nat-title{font-size:12px;font-weight:800;letter-spacing:.01em}#nat-minimize{width:38px;height:32px;flex-basis:38px;border-color:#6980a0;border-radius:7px;background:#263b59;transition:transform .15s ease,filter .15s ease}#nat-minimize:hover{transform:translateY(-1px)}" +
-            "#nat-body{display:flex!important;padding:12px;background:linear-gradient(180deg,rgba(15,22,34,.45),rgba(10,15,24,.18));overflow:auto;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}#nat-body:focus-visible{outline:2px solid #8eb5e5;outline-offset:-2px}#nat-wrapper[data-theme='light'] #nat-body{background:rgba(227,237,248,.35)}#nat-content{gap:10px;width:calc(100% / var(--nat-scale,1));align-content:start}.nat-list{padding:0;width:100%;max-height:none;overflow:visible;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}#nat-body::-webkit-scrollbar,.nat-list::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;background:transparent!important}#nat-body::-webkit-scrollbar-track,#nat-body::-webkit-scrollbar-thumb,#nat-body::-webkit-scrollbar-corner,.nat-list::-webkit-scrollbar-track,.nat-list::-webkit-scrollbar-thumb,.nat-list::-webkit-scrollbar-corner{background:transparent!important;border:0!important}" +
+            "#nat-body{display:flex!important;padding:12px;background:linear-gradient(180deg,rgba(15,22,34,.45),rgba(10,15,24,.18));overflow:auto;overscroll-behavior:contain;touch-action:pan-y pinch-zoom;-webkit-overflow-scrolling:touch;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}#nat-body:focus-visible{outline:2px solid #8eb5e5;outline-offset:-2px}#nat-wrapper[data-theme='light'] #nat-body{background:rgba(227,237,248,.35)}#nat-content{gap:10px;width:100%;align-content:start}.nat-list{padding:0;width:100%;max-height:none;overflow:visible;scrollbar-width:none;scrollbar-color:transparent transparent;-ms-overflow-style:none}#nat-body::-webkit-scrollbar,.nat-list::-webkit-scrollbar{display:none!important;width:0!important;height:0!important;background:transparent!important}#nat-body::-webkit-scrollbar-track,#nat-body::-webkit-scrollbar-thumb,#nat-body::-webkit-scrollbar-corner,.nat-list::-webkit-scrollbar-track,.nat-list::-webkit-scrollbar-thumb,.nat-list::-webkit-scrollbar-corner{background:transparent!important;border:0!important}" +
             "#nat-wrapper button{border:1px solid #455f84;border-radius:7px;background:#263b59;color:#f7fbff;padding:7px 9px;font-size:11px;font-weight:700;line-height:1.15;transition:transform .15s ease,filter .15s ease,background .15s ease}#nat-wrapper button:hover:not(:disabled){filter:brightness(1.13);transform:translateY(-1px)}#nat-wrapper button:focus-visible{outline:2px solid #8eb5e5;outline-offset:2px}#nat-wrapper[data-theme='light'] button{background:#e4edf8;color:#172033;border-color:#9aafc9}.nat-refresh{align-items:flex-start;gap:10px;padding:1px 1px 0;color:#aebed3;font-size:10px}.nat-sync-status{display:flex;align-items:center;gap:6px;min-width:0;line-height:1.35}.nat-sync-status strong{color:#edf4ff;font-weight:800}.nat-sync-status small{color:#8191a9;white-space:nowrap}.nat-sync-dot{width:7px;height:7px;flex:0 0 7px;border-radius:50%;background:#86d49b;box-shadow:0 0 0 3px rgba(134,212,155,.14)}.nat-sync-dot.is-refreshing{background:#8eb5e5;animation:nat-pulse 1s ease-in-out infinite}@keyframes nat-pulse{50%{transform:scale(.6);opacity:.55}}.nat-top-actions{display:flex;flex:0 0 auto;gap:6px}.nat-refresh-button{background:#28704d!important;border-color:#3b8b62!important}.nat-icon-button{display:grid;place-items:center;width:32px;padding:6px!important;font-size:15px!important}.nat-tabs{display:flex;gap:6px;padding:4px;border:1px solid #34445e;border-radius:9px;background:rgba(7,12,20,.35);flex-wrap:nowrap}.nat-tab{flex:1 1 0;background:transparent!important;border-color:transparent!important;color:#aebed3!important;padding:7px 9px!important}.nat-tab.active{background:#365d99!important;border-color:#5279b3!important;color:#fff!important;box-shadow:0 3px 8px rgba(6,12,22,.28)}" +
             ".nat-grid{gap:10px}.nat-card{position:relative;padding:12px;border-color:#34445e;border-radius:10px;background:linear-gradient(145deg,rgba(34,50,76,.88),rgba(15,22,34,.9));box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 6px 16px rgba(0,0,0,.14)}#nat-wrapper[data-theme='light'] .nat-card{background:linear-gradient(145deg,#ffffff,#f4f8fc);border-color:#cbd8e7;box-shadow:0 5px 14px rgba(38,59,88,.08)}.nat-card-header{align-items:flex-start;margin-bottom:9px}.nat-card-header h2{margin:2px 0 0!important;color:#f7fbff;font-size:15px;font-weight:800;letter-spacing:-.01em}#nat-wrapper[data-theme='light'] .nat-card-header h2{color:#172033}.nat-eyebrow{display:block;color:#8eb5e5;font-size:9px;font-weight:800;letter-spacing:.09em;text-transform:uppercase}.nat-total{display:grid;justify-items:end;gap:2px;flex:0 0 auto}.nat-total strong{color:#9dd8ff!important;font-size:12px!important}.nat-total span,.nat-card-note{color:#93a5bc;font-size:9px;font-weight:700;white-space:nowrap}.nat-card-note{padding:3px 6px;border:1px solid #416081;border-radius:999px;color:#9dd8ff;background:rgba(69,103,145,.16)}.nat-collection-track,.nat-progress-track{height:7px;overflow:hidden;border:1px solid rgba(107,133,166,.28);border-radius:999px;background:rgba(6,11,18,.58)}.nat-collection-track i,.nat-progress-track i{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#58c98a,#9de3aa);box-shadow:0 0 12px rgba(88,201,138,.34)}.nat-collection-track{margin:0 0 10px}.nat-chips{gap:5px;margin:0 0 10px}.nat-chip{padding:3px 6px;border-color:#3e5372;border-radius:999px;background:rgba(9,16,26,.36);font-size:9px;font-weight:750}.nat-section-label{margin:0 -1px 1px;color:#8a9bb1;font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}" +
             ".nat-award-row{display:grid;grid-template-columns:4px minmax(0,1fr) auto;gap:9px;align-items:start;padding:9px 2px;border-color:#2c3c52;transition:background .15s ease}.nat-award-row:hover{background:rgba(87,125,172,.12)}.nat-award-marker{display:block;min-height:31px;border-radius:999px;box-shadow:0 0 10px currentColor}.nat-award-copy{min-width:0}.nat-award-name{font-size:11px;font-weight:800;line-height:1.25}.nat-description{margin-top:3px;color:#aebed3;font-size:10px;line-height:1.4}.nat-award-row time{align-self:start;margin-top:1px;padding:3px 5px;border:1px solid #3d5270;border-radius:5px;color:#9fb0c7;font-size:9px;line-height:1.2;text-align:right;white-space:nowrap}.nat-progress-card{padding-bottom:6px}.nat-progress-row{padding:10px 0;border-color:#2c3c52}.nat-progress-row:first-of-type{border-top:0;padding-top:0}.nat-progress-header{align-items:start}.nat-progress-percent{padding:3px 6px;border:1px solid #3b855e;border-radius:999px;color:#9de3aa!important;background:rgba(46,122,79,.17);font-size:10px!important}.nat-progress-track{height:8px;margin-top:8px}.nat-progress-value{display:flex;justify-content:space-between;gap:8px;margin-top:5px;color:#98a9bf;font-size:10px}.nat-progress-type{color:#8eb5e5;font-weight:800;text-transform:capitalize}" +
@@ -1926,6 +1960,7 @@
         initializeDashboard();
         bindActivityLifecycle();
         scheduleDailyRefresh();
+        queueMissedDailyRefresh("startup");
     }
     detectRuntimeAtStartup();
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => void bootstrap());

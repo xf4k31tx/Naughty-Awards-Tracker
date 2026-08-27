@@ -12,7 +12,7 @@ Naughty Awards Tracker is an open-source Torn userscript that gives players a fo
 - Collection completion summaries, completion bars, earned/incomplete counts, and rarity chips.
 - Award rows with rarity color, title, description, and earned date when applicable.
 - Dark and lower-glare light themes.
-- Manual refresh plus an automatic daily refresh at 00:00 UTC. Automatic refresh pauses while the document/tab is inactive and safely resumes when it becomes active again.
+- Manual refresh plus an automatic daily refresh at 00:04 UTC, after Torn's daily API update window. If an active tracker opens or resumes with no snapshot for the current refresh period, it performs one guarded catch-up refresh; inactive tabs remain paused.
 - Persistent API key, panel layout, theme, active tab, collection view, and search state.
 - Native TornPDA detection, safe-area handling, orientation-aware layout, touch-friendly controls, toasts, and daily refresh reminders.
 
@@ -42,11 +42,11 @@ Search state and the selected completed/incomplete view are retained locally whe
 
 ### Settings and refresh
 
-Use the settings button to save or replace the Torn API key, switch theme, inspect the detected runtime, schedule a refresh reminder, and reset the widget layout. The refresh button reloads award and progress data immediately. A daily timer refreshes automatically at 00:00 UTC only while the script is active; inactive tabs/documents do not start background refreshes and catch up safely when restored.
+Use the settings button to save or replace the Torn API key, switch theme, inspect the detected runtime, schedule a refresh reminder, and reset the widget layout. The refresh button reloads award and progress data immediately. A daily timer refreshes automatically at 00:04 UTC only while the script is active. If the saved snapshot predates the current 00:04 UTC refresh period, an active launch or restored tab performs one catch-up refresh; inactive tabs/documents do not start background requests.
 
 ## Desktop and TornPDA
 
-The desktop widget is movable, resizable, and minimizable. A minimized launcher restores when tapped or clicked anywhere on its icon; drag the icon to choose its saved launcher location, which is reused on later minimizes without changing the full widget's saved placement. TornPDA is detected through its native bridge; the mobile layout follows the live viewport, safe areas, and orientation. When available, the tracker enables the native `navigator.virtualKeyboard.overlaysContent` mode so the keyboard overlays the panel. It also freezes the panel layout at the pre-keyboard viewport as a visual-viewport fallback, preventing the script from shrinking, moving, or collapsing while you type; normal rotation and viewport changes still re-clamp the panel. Saved dimensions and placement are clamped to the live, safe-area-adjusted bounds, while compact controls, cards, and award rows reflow without horizontal scrolling. Long content uses one keyboard-focusable content region: desktop wheel/keyboard and TornPDA touch scrolling stay active while scrollbar tracks remain hidden. Its metadata declares both legacy and modern userscript storage/network grants for TornPDA and Tampermonkey compatibility.
+The desktop widget is movable, resizable, and minimizable. A minimized launcher restores when tapped or clicked anywhere on its icon; drag the icon to choose its saved launcher location, which is reused on later minimizes without changing the full widget's saved placement. TornPDA is detected through its native bridge; the mobile layout follows the live viewport, safe areas, and orientation. When available, the tracker enables the native `navigator.virtualKeyboard.overlaysContent` mode so the keyboard overlays the panel. It also freezes the panel layout at the pre-keyboard viewport as a visual-viewport fallback, preventing the script from shrinking, moving, or collapsing while you type; normal rotation and viewport changes still re-clamp the panel. Saved dimensions and placement are clamped to the live, safe-area-adjusted bounds, while compact controls, cards, and award rows reflow without horizontal scrolling. Long content keeps its readable size in one keyboard-focusable content region: desktop wheel/keyboard and TornPDA touch scrolling stay active while scrollbar tracks remain hidden. Its metadata declares both legacy and modern userscript storage/network grants for TornPDA and Tampermonkey compatibility.
 
 ## TornPDA compatibility and storage
 

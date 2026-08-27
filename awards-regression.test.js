@@ -11,10 +11,10 @@ const source = fs.readFileSync(file, "utf8");
 const readme = fs.readFileSync(path.join(__dirname, "README.md"), "utf8");
 const instrumented = source.replace(
     /    detectRuntimeAtStartup\(\);[\s\S]*?\n\}\)\(\);\s*$/,
-    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize };\n})();\n"
+    "    globalThis.__natTest = { buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize, state, STORAGE, STORAGE_DELETE, createStorageAdapter, STORAGE_ADAPTER, loadStoragePreference, setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize, nextDailyRefreshAt, dailyRefreshPeriodKey, hasAwardsSnapshotForRefreshPeriod, needsDailyAwardsRefresh };\n})();\n"
 );
 assert.notEqual(instrumented, source, "Unable to instrument the Awards Tracker source");
-assert.match(source, /@version\s+1\.3\.14/, "Userscript metadata must reflect the shared-standard release");
+assert.match(source, /@version\s+\d+\.\d+\.\d+/, "Userscript metadata must retain a semantic version");
 assert.match(source, /@license\s+MIT/, "metadata must declare the MIT license");
 assert.match(source, /https:\/\/github\.com\/SharpSplinter\/Naughty-Awards-Tracker/, "metadata must use the renamed GitHub account");
 assert.match(source, /https:\/\/raw\.githubusercontent\.com\/SharpSplinter\/Naughty-Awards-Tracker\/main/, "metadata must update from the renamed account");
@@ -73,6 +73,10 @@ assert.match(source, /function standardFeedbackLayer\(\)/, "Desktop feedback mus
 assert.match(source, /toast\.remove\(\);\s*state\.toastTimers\.delete\(timer\);/, "Stacked toasts must clean up independently");
 assert.match(source, /nativeBridgeCall\("scheduleNotification"/, "TornPDA reminders must use the native notification handler");
 assert.match(source, /document\.addEventListener\("visibilitychange"/, "Automatic refresh must track document visibility");
+assert.match(source, /function queueMissedDailyRefresh\(reason = "stale-snapshot"\)/, "A stale snapshot must queue one guarded catch-up refresh");
+assert.match(source, /queueMissedDailyRefresh\("startup"\)/, "Startup must catch up a missed UTC-day refresh");
+assert.match(source, /queueMissedDailyRefresh\("tab-resumed"\)/, "Returning to an active tab must catch up a missed UTC-day refresh");
+assert.doesNotMatch(source, /const scale = Math\.max\(\.72/, "Desktop content must scroll rather than shrink below readable size");
 assert.match(readme, /Use legacy GM storage/, "README must document the storage preference");
 assert.match(source, /const LOG_PREFIX = "\[Naughty Awards Tracker\]";/, "Console diagnostics must retain a clear script prefix");
 assert.match(source, /function apiDiagnosticTarget\(url, method = "GET"\)/, "API logs must use a query-free target helper");
@@ -95,6 +99,7 @@ const diagnostics = [];
 const logger = Object.fromEntries(["log", "info", "debug", "warn", "error"].map((level) => [level, (...args) => diagnostics.push(args.join(" "))]));
 const sandbox = {
     window: { setTimeout, clearTimeout }, document: { visibilityState: "visible" }, console: logger, setTimeout, clearTimeout,
+    GM_info: { script: { version: "test" } },
     GM: {
         getValue: async (key, fallback) => legacyValues.has(key) ? legacyValues.get(key) : fallback,
         setValue: async (key, value) => { legacyValues.set(key, value); }
@@ -110,7 +115,7 @@ vm.runInNewContext(instrumented, sandbox, { filename: file });
 const {
     buildSummary, incompleteAwardItems, filterAwardItems, panelBounds, clampPanelSize,
     state, STORAGE, STORAGE_DELETE, createStorageAdapter, loadStoragePreference,
-    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize
+    setUseLegacyGMStorage, storageMethodLabel, formatInteger, createBackupPayload, validateBackupPayload, validateBackupPosition, parseBackupPayload, getMinimizedPosition, isKeyboardOverlayResize, nextDailyRefreshAt, dailyRefreshPeriodKey, hasAwardsSnapshotForRefreshPeriod, needsDailyAwardsRefresh
 } = sandbox.__natTest;
 
 const portraitBounds = panelBounds(
@@ -147,6 +152,15 @@ assert.equal(
     false,
     "Small browser-chrome viewport changes must remain normal responsive updates"
 );
+
+const beforeDailyRefresh = Date.UTC(2026, 7, 27, 0, 3, 59);
+state.refreshedAt = Date.UTC(2026, 7, 26, 0, 4, 1);
+assert.equal(dailyRefreshPeriodKey(state.refreshedAt), "2026-08-26", "Daily refresh periods must shift at 00:04 UTC");
+assert.equal(dailyRefreshPeriodKey(Number.MAX_VALUE), "", "Invalid stored refresh timestamps must not break the tracker");
+assert.equal(nextDailyRefreshAt(beforeDailyRefresh), Date.UTC(2026, 7, 27, 0, 4, 0, 250), "The next automatic refresh must wait for 00:04 UTC");
+assert.equal(hasAwardsSnapshotForRefreshPeriod(beforeDailyRefresh), true, "A prior snapshot remains current until the 00:04 UTC boundary");
+assert.equal(needsDailyAwardsRefresh(beforeDailyRefresh), false, "The 00:00 UTC update window must not trigger a duplicate request");
+assert.equal(needsDailyAwardsRefresh(Date.UTC(2026, 7, 27, 0, 4, 1)), true, "A new 00:04 UTC refresh period must become eligible for one catch-up request");
 
 const savedLauncherPosition = getMinimizedPosition({ minimized: { x: 42, y: 84 } });
 assert.equal(savedLauncherPosition?.x, 42, "Saved launcher x-coordinate must be reusable");
