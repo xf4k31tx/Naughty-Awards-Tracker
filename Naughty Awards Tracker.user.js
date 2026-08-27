@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Naughty Awards Tracker
 // @namespace    https://github.com/SharpSplinter/Naughty-Awards-Tracker
-// @version      1.3.19
+// @version      1.3.20
 // @description  Focused Torn medal, honor, and award-progress tracker.
 // @author       SharpSplinter [315311]
 // @license      MIT
